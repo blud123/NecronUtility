@@ -22,10 +22,10 @@ repositories {
 dependencies {
     // Fabric
     minecraft(libs.minecraft)
-    implementation(libs.fabric.loader)
-
+    mappings(variantOf(libs.yarn) { classifier("v2") })
+    modImplementation(libs.fabric.loader)
     // Meteor
-    implementation(libs.meteor.client)
+    modImplementation(libs.meteor.client)
 }
 
 java {
