@@ -64,8 +64,12 @@ tasks {
     withType<JavaCompile>().configureEach {
         options.compilerArgs.addAll(
             listOf(
+                "--enable-preview",
                 "-Xlint:deprecation",
                 "-Xlint:unchecked"
+        )
+    )
+}
             )
         )
     }
