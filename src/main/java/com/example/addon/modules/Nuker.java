@@ -6,12 +6,11 @@ import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.world.BlockIterator;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
-import net.minecraft.item.Items;
-import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -91,7 +90,7 @@ public class Nuker extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
+        if (mc.player == null || mc.level == null || mc.gameMode == null) return;
 
         List<BlockPos> targets = collectTargets();
         if (targets.isEmpty()) return;
@@ -100,7 +99,7 @@ public class Nuker extends Module {
         for (BlockPos pos : targets) {
             if (broken >= blocksPerTick.get()) break;
 
-            BlockState state = mc.world.getBlockState(pos);
+            BlockState state = mc.level.getBlockState(pos);
             if (shouldSkip(state)) continue;
 
             if (autoTool.get()) equipBestTool(state);
@@ -108,18 +107,17 @@ public class Nuker extends Module {
                 Rotations.getYaw(pos), Rotations.getPitch(pos), null);
 
             if (packetMine.get()) {
-                // Instant-break packet pair
-                mc.player.networkHandler.sendPacket(
-                    new PlayerActionC2SPacket(
-                        PlayerActionC2SPacket.Action.START_DESTROY_BLOCK,
+                mc.player.connection.sendPacket(
+                    new ServerboundPlayerActionPacket(
+                        ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK,
                         pos, Direction.UP));
-                mc.player.networkHandler.sendPacket(
-                    new PlayerActionC2SPacket(
-                        PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK,
+                mc.player.connection.sendPacket(
+                    new ServerboundPlayerActionPacket(
+                        ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK,
                         pos, Direction.UP));
-                mc.world.setBlockState(pos, Blocks.AIR.getDefaultState(), 3);
+                mc.level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
             } else {
-                mc.interactionManager.attackBlock(pos, Direction.UP);
+                mc.gameMode.startDestroyBlock(pos, Direction.UP);
             }
             broken++;
         }
@@ -131,16 +129,16 @@ public class Nuker extends Module {
 
         BlockIterator.register((int) Math.ceil(r), (int) Math.ceil(r), (pos, state) -> {
             if (state.isAir()) return;
-            if (mc.player.squaredDistanceTo(
+            if (mc.player.distanceToSqr(
                 pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > r * r) return;
 
             if (onlyExposed.get() && !hasExposedFace(pos)) return;
-            list.add(pos.toImmutable());
+            list.add(new BlockPos(pos));
         });
 
         Comparator<BlockPos> comp = switch (sortMode.get()) {
             case CLOSEST -> Comparator.comparingDouble(p ->
-                mc.player.squaredDistanceTo(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5));
+                mc.player.distanceToSqr(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5));
             case LOWEST  -> Comparator.comparingInt(BlockPos::getY);
             case HIGHEST -> Comparator.comparingInt((BlockPos p) -> p.getY()).reversed();
         };
@@ -150,7 +148,7 @@ public class Nuker extends Module {
 
     private boolean hasExposedFace(BlockPos pos) {
         for (Direction dir : Direction.values()) {
-            if (mc.world.getBlockState(pos.offset(dir)).isAir()) return true;
+            if (mc.level.getBlockState(pos.relative(dir)).isAir()) return true;
         }
         return false;
     }
@@ -167,10 +165,9 @@ public class Nuker extends Module {
         int bestSlot = -1;
         float bestSpeed = -1;
         for (int i = 0; i < 9; i++) {
-            float speed = mc.player.getInventory().getStack(i)
-                .getMiningSpeedMultiplier(state);
+            float speed = mc.player.getInventory().getItem(i).getDestroySpeed(state);
             if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
         }
-        if (bestSlot != -1) mc.player.getInventory().selectedSlot = bestSlot;
+        if (bestSlot != -1) mc.player.getInventory().selected = bestSlot;
     }
 }
