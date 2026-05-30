@@ -35,12 +35,8 @@ java {
 }
 
 fun toMinecraftCompat(version: String): String {
-    val match = Regex("""^(\d{2})\.([1-9]\d*)(?:\.([1-9]\d*))?$""")
-        .matchEntire(version)
-        ?: error("Invalid Minecraft version format: $version. Expected YY.D or YY.D.H")
-
-    val (year, drop, _) = match.destructured
-    return "~$year.$drop"
+    val parts = version.split(".")
+    return "~${parts[0]}.${parts[1]}"
 }
 
 tasks {
