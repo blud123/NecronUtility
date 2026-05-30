@@ -6,6 +6,7 @@ import com.example.addon.modules.ElytraBouncePlus;
 import com.example.addon.modules.FastBreak;
 import com.example.addon.modules.ModuleExample;
 import com.example.addon.modules.Nuker;
+import com.example.addon.modules.PacketFastFly;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
@@ -30,6 +31,7 @@ public class AddonTemplate extends MeteorAddon {
         Modules.get().add(new Nuker());
         Modules.get().add(new FastBreak());
         Modules.get().add(new ElytraBouncePlus());
+        Modules.get().add(new PacketFastFly());
 
         // Commands
         Commands.add(new CommandExample());

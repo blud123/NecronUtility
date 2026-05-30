@@ -8,7 +8,8 @@
     "ElytraEntityMixin",
     "ElytraLivingEntityMixin",
     "EntityAccessor",
-    "LivingEntityInvoker"
+    "LivingEntityInvoker",
+    "IServerboundMovePlayerPacket"
   ],
   "injectors": {
     "defaultRequire": 1
