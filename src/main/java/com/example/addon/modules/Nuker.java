@@ -162,13 +162,7 @@ public class Nuker extends Module {
             return;
         }
 
-        if (packetMine.get()) {
-            int bestSlot = autoTool.get() ? findBestToolSlot(targets) : mc.player.getInventory().selected;
-            if (bestSlot != mc.player.getInventory().selected) {
-                mc.player.getInventory().selected = bestSlot;
-                mc.player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-            }
-        }
+        int originalSlot = mc.player.getInventory().selected;
 
         int broken = 0;
         for (BlockPos pos : targets) {
@@ -185,6 +179,10 @@ public class Nuker extends Module {
                 Rotations.getYaw(pos), Rotations.getPitch(pos), null);
 
             if (packetMine.get()) {
+                if (autoTool.get()) {
+                    int toolSlot = getBestToolSlot(state);
+                    mc.player.connection.send(new ServerboundSetCarriedItemPacket(toolSlot));
+                }
                 Direction face = getFacing(pos);
                 mc.player.connection.send(
                     new ServerboundPlayerActionPacket(
@@ -199,6 +197,11 @@ public class Nuker extends Module {
                 mc.gameMode.startDestroyBlock(pos, getFacing(pos));
             }
             broken++;
+        }
+
+        if (packetMine.get() && autoTool.get()) {
+            mc.player.getInventory().selected = originalSlot;
+            mc.player.connection.send(new ServerboundSetCarriedItemPacket(originalSlot));
         }
 
         miningTicks.keySet().removeIf(pos -> !currentTargets.contains(pos));
@@ -298,17 +301,12 @@ public class Nuker extends Module {
         return dz > 0 ? Direction.SOUTH : Direction.NORTH;
     }
 
-    private int findBestToolSlot(List<BlockPos> targets) {
+    private int getBestToolSlot(BlockState state) {
         int bestSlot = mc.player.getInventory().selected;
-        float bestScore = -1;
+        float bestSpeed = -1;
         for (int i = 0; i < 9; i++) {
-            float score = 0;
-            for (BlockPos pos : targets) {
-                BlockState state = mc.level.getBlockState(pos);
-                if (shouldSkip(state)) continue;
-                score += mc.player.getInventory().getItem(i).getDestroySpeed(state);
-            }
-            if (score > bestScore) { bestScore = score; bestSlot = i; }
+            float speed = mc.player.getInventory().getItem(i).getDestroySpeed(state);
+            if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
         }
         return bestSlot;
     }
