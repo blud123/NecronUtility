@@ -12,6 +12,7 @@ import meteordevelopment.orbit.EventHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
@@ -161,6 +162,14 @@ public class Nuker extends Module {
             return;
         }
 
+        if (packetMine.get()) {
+            int bestSlot = autoTool.get() ? findBestToolSlot(targets) : mc.player.getInventory().selected;
+            if (bestSlot != mc.player.getInventory().selected) {
+                mc.player.getInventory().selected = bestSlot;
+                mc.player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
+            }
+        }
+
         int broken = 0;
         for (BlockPos pos : targets) {
             if (broken >= blocksPerTick.get()) break;
@@ -172,7 +181,6 @@ public class Nuker extends Module {
             currentTargets.add(pos);
             miningTicks.merge(pos, 1, Integer::sum);
 
-            if (autoTool.get()) equipBestTool(state);
             if (rotate.get()) Rotations.rotate(
                 Rotations.getYaw(pos), Rotations.getPitch(pos), null);
 
@@ -187,6 +195,7 @@ public class Nuker extends Module {
                         ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK,
                         pos, face));
             } else {
+                if (autoTool.get()) equipBestTool(state);
                 mc.gameMode.startDestroyBlock(pos, getFacing(pos));
             }
             broken++;
@@ -287,6 +296,21 @@ public class Nuker extends Module {
         if (ay >= ax && ay >= az) return dy > 0 ? Direction.UP : Direction.DOWN;
         if (ax >= az) return dx > 0 ? Direction.EAST : Direction.WEST;
         return dz > 0 ? Direction.SOUTH : Direction.NORTH;
+    }
+
+    private int findBestToolSlot(List<BlockPos> targets) {
+        int bestSlot = mc.player.getInventory().selected;
+        float bestScore = -1;
+        for (int i = 0; i < 9; i++) {
+            float score = 0;
+            for (BlockPos pos : targets) {
+                BlockState state = mc.level.getBlockState(pos);
+                if (shouldSkip(state)) continue;
+                score += mc.player.getInventory().getItem(i).getDestroySpeed(state);
+            }
+            if (score > bestScore) { bestScore = score; bestSlot = i; }
+        }
+        return bestSlot;
     }
 
     private void equipBestTool(BlockState state) {
