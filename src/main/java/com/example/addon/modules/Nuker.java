@@ -107,11 +107,11 @@ public class Nuker extends Module {
                 Rotations.getYaw(pos), Rotations.getPitch(pos), null);
 
             if (packetMine.get()) {
-                mc.player.connection.sendPacket(
+                mc.player.connection.send(
                     new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK,
                         pos, Direction.UP));
-                mc.player.connection.sendPacket(
+                mc.player.connection.send(
                     new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK,
                         pos, Direction.UP));
