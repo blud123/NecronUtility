@@ -34,7 +34,7 @@ public class Nuker extends Module {
     private final Setting<Integer> blocksPerTick = sgGeneral.add(new IntSetting.Builder()
         .name("blocks-per-tick")
         .description("How many blocks to break per tick. Keep low on 2b2t (1-2).")
-        .defaultValue(1)
+        .defaultValue(2)
         .min(1).max(4)
         .sliderRange(1, 4)
         .build());
@@ -84,9 +84,16 @@ public class Nuker extends Module {
 
     public enum SortMode { CLOSEST, LOWEST, HIGHEST }
 
+    private String miningBlockName = "";
+
     public Nuker() {
         super(com.example.addon.AddonTemplate.CATEGORY, "nuker",
             "Breaks all blocks in a circle. Tuned for 2b2t lag.");
+    }
+
+    @Override
+    public String getInfoString() {
+        return miningBlockName.isEmpty() ? null : miningBlockName;
     }
 
     @EventHandler
@@ -94,7 +101,10 @@ public class Nuker extends Module {
         if (mc.player == null || mc.level == null || mc.gameMode == null) return;
 
         List<BlockPos> targets = collectTargets();
-        if (targets.isEmpty()) return;
+        if (targets.isEmpty()) {
+            miningBlockName = "";
+            return;
+        }
 
         int broken = 0;
         for (BlockPos pos : targets) {
@@ -102,6 +112,8 @@ public class Nuker extends Module {
 
             BlockState state = mc.level.getBlockState(pos);
             if (shouldSkip(state)) continue;
+
+            if (broken == 0) miningBlockName = state.getBlock().getName().getString();
 
             if (autoTool.get()) equipBestTool(state);
             if (rotate.get()) Rotations.rotate(
@@ -128,7 +140,8 @@ public class Nuker extends Module {
         List<BlockPos> list = new ArrayList<>();
         double r = radius.get();
         int ri = (int) Math.ceil(r);
-        BlockPos origin = mc.player.blockPosition();
+        Vec3 eye = mc.player.getEyePosition();
+        BlockPos origin = BlockPos.containing(eye);
 
         for (int dx = -ri; dx <= ri; dx++) {
             for (int dy = -ri; dy <= ri; dy++) {
@@ -136,17 +149,19 @@ public class Nuker extends Module {
                     BlockPos pos = origin.offset(dx, dy, dz);
                     BlockState state = mc.level.getBlockState(pos);
                     if (state.isAir()) continue;
-                    if (mc.player.distanceToSqr(
-                        pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > r * r) continue;
+                    double distSq = eye.distanceToSqr(
+                        pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+                    if (distSq > r * r) continue;
                     if (onlyExposed.get() && !hasExposedFace(pos)) continue;
                     list.add(pos);
                 }
             }
         }
 
+        Vec3 sortEye = eye;
         Comparator<BlockPos> comp = switch (sortMode.get()) {
             case CLOSEST -> Comparator.comparingDouble(p ->
-                mc.player.distanceToSqr(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5));
+                sortEye.distanceToSqr(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5));
             case LOWEST  -> Comparator.comparingInt(BlockPos::getY);
             case HIGHEST -> Comparator.comparingInt((BlockPos p) -> p.getY()).reversed();
         };
