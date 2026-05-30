@@ -10,7 +10,7 @@ public class CommandExample extends Command {
     }
     @Override
     public void build(LiteralArgumentBuilder<SharedSuggestionProvider> builder) {
-        builder.executes(_ -> {
+        builder.executes(context -> {
             info("hi");
             return SINGLE_SUCCESS;
         });
