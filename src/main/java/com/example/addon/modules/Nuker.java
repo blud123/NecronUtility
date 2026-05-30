@@ -1,10 +1,13 @@
 package com.example.addon.modules;
 
+import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.Rotations;
-import meteordevelopment.meteorclient.utils.world.BlockIterator;
+import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -13,14 +16,13 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
+import java.util.*;
 
 public class Nuker extends Module {
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgFilter   = settings.createGroup("Filter");
+    private final SettingGroup sgRender   = settings.createGroup("Render");
 
     // — General —
     private final Setting<Double> radius = sgGeneral.add(new DoubleSetting.Builder()
@@ -76,6 +78,54 @@ public class Nuker extends Module {
         .defaultValue(true)
         .build());
 
+    // — Render —
+    private final Setting<Boolean> renderBlocks = sgRender.add(new BoolSetting.Builder()
+        .name("render")
+        .description("Render an overlay on blocks being mined.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<ShapeMode> shapeMode = sgRender.add(new EnumSetting.Builder<ShapeMode>()
+        .name("shape-mode")
+        .description("How to render the block overlay.")
+        .defaultValue(ShapeMode.Both)
+        .build());
+
+    private final Setting<SettingColor> fillColor = sgRender.add(new ColorSetting.Builder()
+        .name("fill-color")
+        .description("Color of the overlay fill.")
+        .defaultValue(new SettingColor(255, 0, 0, 50))
+        .build());
+
+    private final Setting<SettingColor> outlineColor = sgRender.add(new ColorSetting.Builder()
+        .name("outline-color")
+        .description("Color of the overlay outline.")
+        .defaultValue(new SettingColor(255, 0, 0, 255))
+        .build());
+
+    private final Setting<Boolean> rainbow = sgRender.add(new BoolSetting.Builder()
+        .name("rainbow")
+        .description("Cycle through rainbow colors.")
+        .defaultValue(false)
+        .build());
+
+    private final Setting<Double> rainbowSpeed = sgRender.add(new DoubleSetting.Builder()
+        .name("rainbow-speed")
+        .description("Speed of the rainbow cycle.")
+        .defaultValue(1.0)
+        .min(0.1).max(5.0)
+        .sliderRange(0.1, 5.0)
+        .visible(rainbow::get)
+        .build());
+
+    private final Setting<Integer> animationLength = sgRender.add(new IntSetting.Builder()
+        .name("animation-ticks")
+        .description("How many ticks the expand animation takes.")
+        .defaultValue(8)
+        .min(1).max(20)
+        .sliderRange(1, 20)
+        .build());
+
     private final Setting<SortMode> sortMode = sgGeneral.add(new EnumSetting.Builder<SortMode>()
         .name("sort-mode")
         .description("Order in which to target blocks.")
@@ -85,6 +135,8 @@ public class Nuker extends Module {
     public enum SortMode { CLOSEST, LOWEST, HIGHEST }
 
     private String miningBlockName = "";
+    private final Map<BlockPos, Integer> miningTicks = new LinkedHashMap<>();
+    private final List<BlockPos> currentTargets = new ArrayList<>();
 
     public Nuker() {
         super(com.example.addon.AddonTemplate.CATEGORY, "nuker",
@@ -101,8 +153,11 @@ public class Nuker extends Module {
         if (mc.player == null || mc.level == null || mc.gameMode == null) return;
 
         List<BlockPos> targets = collectTargets();
+        currentTargets.clear();
+
         if (targets.isEmpty()) {
             miningBlockName = "";
+            miningTicks.clear();
             return;
         }
 
@@ -114,6 +169,8 @@ public class Nuker extends Module {
             if (shouldSkip(state)) continue;
 
             if (broken == 0) miningBlockName = state.getBlock().getName().getString();
+            currentTargets.add(pos);
+            miningTicks.merge(pos, 1, Integer::sum);
 
             if (autoTool.get()) equipBestTool(state);
             if (rotate.get()) Rotations.rotate(
@@ -133,6 +190,43 @@ public class Nuker extends Module {
                 mc.gameMode.startDestroyBlock(pos, getFacing(pos));
             }
             broken++;
+        }
+
+        miningTicks.keySet().removeIf(pos -> !currentTargets.contains(pos));
+    }
+
+    @EventHandler
+    private void onRender(Render3DEvent event) {
+        if (!renderBlocks.get() || currentTargets.isEmpty()) return;
+
+        for (BlockPos pos : currentTargets) {
+            int ticks = miningTicks.getOrDefault(pos, 1);
+            float progress = Math.min((float) ticks / animationLength.get(), 1.0f);
+
+            Color side;
+            Color line;
+
+            if (rainbow.get()) {
+                float hue = (float) ((System.currentTimeMillis() / 1000.0 * rainbowSpeed.get()) % 1.0);
+                int rgb = java.awt.Color.HSBtoRGB(hue, 1.0f, 1.0f);
+                int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+                side = new Color(r, g, b, fillColor.get().a);
+                line = new Color(r, g, b, outlineColor.get().a);
+            } else {
+                side = fillColor.get();
+                line = outlineColor.get();
+            }
+
+            double cx = pos.getX() + 0.5;
+            double cy = pos.getY() + 0.5;
+            double cz = pos.getZ() + 0.5;
+            double half = progress * 0.5;
+
+            event.renderer.box(
+                cx - half, cy - half, cz - half,
+                cx + half, cy + half, cz + half,
+                side, line, shapeMode.get(), 0
+            );
         }
     }
 
