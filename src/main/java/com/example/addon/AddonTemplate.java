@@ -2,6 +2,8 @@ package com.example.addon;
 
 import com.example.addon.commands.CommandExample;
 import com.example.addon.hud.HudExample;
+import com.example.addon.modules.ElytraBouncePlus;
+import com.example.addon.modules.FastBreak;
 import com.example.addon.modules.ModuleExample;
 import com.example.addon.modules.Nuker;
 import com.mojang.logging.LogUtils;
@@ -26,6 +28,8 @@ public class AddonTemplate extends MeteorAddon {
         // Modules
         Modules.get().add(new ModuleExample());
         Modules.get().add(new Nuker());
+        Modules.get().add(new FastBreak());
+        Modules.get().add(new ElytraBouncePlus());
 
         // Commands
         Commands.add(new CommandExample());
