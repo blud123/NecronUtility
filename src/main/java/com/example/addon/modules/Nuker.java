@@ -11,6 +11,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -107,17 +108,17 @@ public class Nuker extends Module {
                 Rotations.getYaw(pos), Rotations.getPitch(pos), null);
 
             if (packetMine.get()) {
+                Direction face = getFacing(pos);
                 mc.player.connection.send(
                     new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK,
-                        pos, Direction.UP));
+                        pos, face));
                 mc.player.connection.send(
                     new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK,
-                        pos, Direction.UP));
-                mc.level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+                        pos, face));
             } else {
-                mc.gameMode.startDestroyBlock(pos, Direction.UP);
+                mc.gameMode.startDestroyBlock(pos, getFacing(pos));
             }
             broken++;
         }
@@ -126,15 +127,22 @@ public class Nuker extends Module {
     private List<BlockPos> collectTargets() {
         List<BlockPos> list = new ArrayList<>();
         double r = radius.get();
+        int ri = (int) Math.ceil(r);
+        BlockPos origin = mc.player.blockPosition();
 
-        BlockIterator.register((int) Math.ceil(r), (int) Math.ceil(r), (pos, state) -> {
-            if (state.isAir()) return;
-            if (mc.player.distanceToSqr(
-                pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > r * r) return;
-
-            if (onlyExposed.get() && !hasExposedFace(pos)) return;
-            list.add(new BlockPos(pos));
-        });
+        for (int dx = -ri; dx <= ri; dx++) {
+            for (int dy = -ri; dy <= ri; dy++) {
+                for (int dz = -ri; dz <= ri; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    BlockState state = mc.level.getBlockState(pos);
+                    if (state.isAir()) continue;
+                    if (mc.player.distanceToSqr(
+                        pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > r * r) continue;
+                    if (onlyExposed.get() && !hasExposedFace(pos)) continue;
+                    list.add(pos);
+                }
+            }
+        }
 
         Comparator<BlockPos> comp = switch (sortMode.get()) {
             case CLOSEST -> Comparator.comparingDouble(p ->
@@ -159,6 +167,17 @@ public class Nuker extends Module {
         if (filterFluids.get() &&
             (state.getBlock() == Blocks.WATER || state.getBlock() == Blocks.LAVA)) return true;
         return false;
+    }
+
+    private Direction getFacing(BlockPos pos) {
+        Vec3 eye = mc.player.getEyePosition();
+        double dx = eye.x - (pos.getX() + 0.5);
+        double dy = eye.y - (pos.getY() + 0.5);
+        double dz = eye.z - (pos.getZ() + 0.5);
+        double ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
+        if (ay >= ax && ay >= az) return dy > 0 ? Direction.UP : Direction.DOWN;
+        if (ax >= az) return dx > 0 ? Direction.EAST : Direction.WEST;
+        return dz > 0 ? Direction.SOUTH : Direction.NORTH;
     }
 
     private void equipBestTool(BlockState state) {
