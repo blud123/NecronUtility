@@ -11,6 +11,7 @@
     "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
   },
   "icon": "assets/template/icon.png",
+  "accessWidener": "addon-template.accesswidener",
   "environment": "client",
   "entrypoints": {
     "meteor": [

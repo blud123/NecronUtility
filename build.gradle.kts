@@ -19,6 +19,10 @@ repositories {
     }
 }
 
+loom {
+    accessWidenerPath = file("src/main/resources/addon-template.accesswidener")
+}
+
 dependencies {
     minecraft(libs.minecraft)
     mappings(loom.officialMojangMappings())
