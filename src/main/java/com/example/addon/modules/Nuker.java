@@ -161,9 +161,9 @@ public class Nuker extends Module {
     private final Map<Block, String> nameCache = new HashMap<>();
     private String miningBlockName = "";
 
-    // Single held-slot tracker: the original slot to restore once every multi-tick break is done.
-    // -1 means Nuker is not currently holding a tool.
-    private int savedSlot = -1;
+    // The slot currently synced to the server by Nuker. Initialized to the real selected slot at
+    // activate time so nukerSyncSlot() only sends a packet when it actually changes.
+    private int lastServerSlot = -1;
 
     public Nuker() {
         super(com.example.addon.AddonTemplate.CATEGORY, "nuker",
@@ -177,10 +177,10 @@ public class Nuker extends Module {
 
     @Override
     public void onActivate() {
-        savedSlot = -1;
+        lastServerSlot = mc.player != null ? mc.player.getInventory().getSelectedSlot() : 0;
     }
 
-    // Abort in-progress breaks and restore the tool slot when the module is disabled.
+    // Abort in-progress breaks and restore the server slot when the module is disabled.
     @Override
     public void onDeactivate() {
         if (mc.player != null) {
@@ -189,14 +189,11 @@ public class Nuker extends Module {
                     ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK,
                     pos, getFacing(pos)));
             }
-            if (savedSlot != -1) {
-                mc.player.connection.send(new ServerboundSetCarriedItemPacket(savedSlot));
-                mc.player.getInventory().setSelectedSlot(savedSlot);
-            }
+            nukerSyncSlot(mc.player.getInventory().getSelectedSlot());
         }
         breaks.clear();
         miningBlockName = "";
-        savedSlot = -1;
+        lastServerSlot = -1;
     }
 
     @EventHandler
@@ -208,8 +205,8 @@ public class Nuker extends Module {
         FastBreak fastBreak = Modules.get().get(FastBreak.class);
         boolean useFastBreak = fastBreak != null && fastBreak.isActive();
 
-        // 1) Evict locks that left the radius / turned to air. ABORT mid-break in the standalone
-        //    path (FastBreak owns its own packets, so don't double-abort there).
+        // Evict locks that left the radius / turned to air. ABORT in standalone path only —
+        // FastBreak owns its own packets when active.
         Iterator<Map.Entry<BlockPos, Mining>> it = breaks.entrySet().iterator();
         while (it.hasNext()) {
             BlockPos pos = it.next().getKey();
@@ -222,23 +219,19 @@ public class Nuker extends Module {
             }
         }
 
-        // Once all multi-tick breaks are gone, hand the tool back.
-        if (savedSlot != -1 && breaks.isEmpty()) {
-            mc.player.connection.send(new ServerboundSetCarriedItemPacket(savedSlot));
-            mc.player.getInventory().setSelectedSlot(savedSlot);
-            savedSlot = -1;
-        }
+        int realSlot = mc.player.getInventory().getSelectedSlot();
 
         if (validTargets.isEmpty()) {
+            if (!useFastBreak) nukerSyncSlot(realSlot); // restore server slot if no targets
             miningBlockName = "";
             return;
         }
 
         int budget = useFastBreak ? Math.min(maxBlocks.get(), 2) : maxBlocks.get();
 
-        // 2) Build the active set: every still-valid locked break first (never preempted), then
-        //    fill any free slots with the highest-priority new candidates.
-        List<BlockPos> active = new ArrayList<>(breaks.keySet()); // all current locks keep their slot
+        // Build the active set: every still-valid locked break first (never preempted), then
+        // fill any free slots with the highest-priority new candidates.
+        List<BlockPos> active = new ArrayList<>(breaks.keySet());
         int freeSlots = budget - active.size();
         if (freeSlots > 0) {
             for (BlockPos pos : validTargets) {
@@ -250,6 +243,7 @@ public class Nuker extends Module {
         }
 
         if (active.isEmpty()) {
+            if (!useFastBreak) nukerSyncSlot(realSlot);
             miningBlockName = "";
             return;
         }
@@ -262,8 +256,13 @@ public class Nuker extends Module {
             Rotations.rotate(Rotations.getYaw(first), Rotations.getPitch(first));
         }
 
-        int originalSlot = mc.player.getInventory().getSelectedSlot();
-        int currentSlot  = originalSlot;
+        // Standalone path: sync the best tool for the PRIMARY block to the server and hold it for
+        // ALL breaks this tick. Do NOT switch per-block — the server credits every locked break
+        // from the single held slot each tick. nukerSyncSlot() only sends a packet on change.
+        if (!useFastBreak && autoTool.get()) {
+            int bestSlot = getBestToolSlot(mc.level.getBlockState(active.get(0)));
+            nukerSyncSlot(bestSlot);
+        }
 
         for (BlockPos pos : active) {
             BlockState state = mc.level.getBlockState(pos);
@@ -277,22 +276,12 @@ public class Nuker extends Module {
                 continue;
             }
 
-            // Nuker owns the break. Pick the tool, then decide instant vs multi-tick from speed.
-            int bestSlot = autoTool.get() ? getBestToolSlot(state) : currentSlot;
-            float delta = FastBreak.breakDeltaForSlot(state, pos, bestSlot);
+            // Estimate break speed using the slot currently held on the server.
+            float delta = FastBreak.breakDeltaForSlot(state, pos, lastServerSlot);
             boolean instant = packetMine.get() && delta >= 1.0f;
 
-            if (autoTool.get() && bestSlot != currentSlot) {
-                // Hold the tool across ticks for multi-tick breaks so the server's per-tick
-                // progress calc always sees it. Capture the true original slot once.
-                if (savedSlot == -1) savedSlot = originalSlot;
-                mc.player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-                mc.player.getInventory().setSelectedSlot(bestSlot);
-                currentSlot = bestSlot;
-            }
-
             if (instant) {
-                // One-tick break: START + STOP land in the same tick. Not a persistent lock.
+                // One-tick break: START + STOP in the same tick. Not a persistent lock.
                 mc.player.connection.send(new ServerboundPlayerActionPacket(
                     ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
                 mc.player.connection.send(new ServerboundPlayerActionPacket(
@@ -303,7 +292,7 @@ public class Nuker extends Module {
                 if (m == null) {
                     mc.player.connection.send(new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
-                    m = lock(pos, state, bestSlot);
+                    m = lock(pos, state, lastServerSlot);
                 }
                 m.ticks++;
                 if (delta > 0 && delta * m.ticks >= 1.0f) {
@@ -314,12 +303,17 @@ public class Nuker extends Module {
             }
         }
 
-        // Restore the held tool only when no multi-tick break is keeping it equipped.
-        if (!useFastBreak && breaks.isEmpty() && currentSlot != originalSlot) {
-            mc.player.connection.send(new ServerboundSetCarriedItemPacket(originalSlot));
-            mc.player.getInventory().setSelectedSlot(originalSlot);
-            savedSlot = -1;
+        // Restore the server slot when no multi-tick breaks remain (instant-only tick, or final STOP).
+        if (!useFastBreak && breaks.isEmpty()) {
+            nukerSyncSlot(realSlot);
         }
+    }
+
+    /** Sends SetCarriedItem to the server only when the slot actually changes, keeping churn minimal. */
+    private void nukerSyncSlot(int slot) {
+        if (mc.player == null || slot == lastServerSlot) return;
+        mc.player.connection.send(new ServerboundSetCarriedItemPacket(slot));
+        lastServerSlot = slot;
     }
 
     /** Registers a lock for {@code pos} if absent, computing its render estimate once. */

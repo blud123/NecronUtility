@@ -6,6 +6,7 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
@@ -293,8 +294,13 @@ public class FastBreak extends Module {
      */
     private float getBreakDelta(BlockState state, BlockPos pos, int toolSlot) {
         if (mc.player == null || mc.level == null) return 0;
-        silentSlot = toolSlot; // -1 simply means "no override / use the real hand"
-        return state.getDestroyProgress(mc.player, mc.level, pos);
+        int saved = silentSlot;
+        silentSlot = toolSlot;
+        try {
+            return state.getDestroyProgress(mc.player, mc.level, pos);
+        } finally {
+            silentSlot = saved;
+        }
     }
 
     /**
@@ -307,9 +313,11 @@ public class FastBreak extends Module {
         if (client.player == null || client.level == null) return 0;
         int saved = silentSlot;
         silentSlot = toolSlot;
-        float delta = state.getDestroyProgress(client.player, client.level, pos);
-        silentSlot = saved;
-        return delta;
+        try {
+            return state.getDestroyProgress(client.player, client.level, pos);
+        } finally {
+            silentSlot = saved;
+        }
     }
 
     // ── Silent swap helpers ───────────────────────────────────────────────
@@ -347,6 +355,7 @@ public class FastBreak extends Module {
     @EventHandler
     private void onRender(Render3DEvent event) {
         if (!renderBreak.get() || mc.player == null || mc.level == null) return;
+        if (Modules.get().get(Nuker.class).isActive()) return;
         renderTarget(event, primary);
         renderTarget(event, secondary);
     }
