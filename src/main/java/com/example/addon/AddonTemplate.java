@@ -2,6 +2,7 @@ package com.example.addon;
 
 import com.example.addon.commands.CommandExample;
 import com.example.addon.hud.HudExample;
+import com.example.addon.modules.Disabler;
 import com.example.addon.modules.ElytraBouncePlus;
 import com.example.addon.modules.FastBreak;
 import com.example.addon.modules.ModuleExample;
@@ -32,6 +33,7 @@ public class AddonTemplate extends MeteorAddon {
         Modules.get().add(new FastBreak());
         Modules.get().add(new ElytraBouncePlus());
         Modules.get().add(new PacketFastFly());
+        Modules.get().add(new Disabler());
 
         // Commands
         Commands.add(new CommandExample());
