@@ -4,6 +4,8 @@ import com.example.addon.AddonTemplate;
 import com.example.addon.mixin.EntityAccessor;
 import com.example.addon.mixin.IServerboundMovePlayerPacket;
 import com.example.addon.mixin.LivingEntityInvoker;
+import com.example.addon.utils.HighwayUtil;
+import com.example.addon.utils.PacketLimiter;
 import meteordevelopment.meteorclient.events.entity.player.PlayerMoveEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.utils.Utils;
@@ -26,7 +28,10 @@ public class ElytraBouncePlus extends Module {
 
     public enum Mode { DIAGONAL, CARDINAL }
 
-    private enum HighwayAxis { X_AXIS, Z_AXIS, NONE }
+    // How close (blocks) to the x=0 / z=0 axis line counts as "on the highway".
+    private static final double HIGHWAY_TOLERANCE = 5.0;
+    // Minimum ticks between START_FALL_FLYING sends (edge-trigger cooldown).
+    private static final int FALL_FLY_COOLDOWN = 10;
 
     private final SettingGroup sg        = settings.getDefaultGroup();
     private final SettingGroup sgPacket  = settings.createGroup("Packet Bounce");
@@ -131,22 +136,6 @@ public class ElytraBouncePlus extends Module {
         .sliderRange(1.1, 10.0)
         .build());
 
-    private final Setting<Double> bounceOffsetStep = sgPacket.add(new DoubleSetting.Builder()
-        .name("bounce-offset-step")
-        .description("How far each packet nudges you away from the wall per tick.")
-        .defaultValue(0.1)
-        .min(0.01).max(0.5)
-        .sliderRange(0.01, 0.5)
-        .build());
-
-    private final Setting<Integer> packetBurst = sgPacket.add(new IntSetting.Builder()
-        .name("packet-burst")
-        .description("Number of position packets sent per tick during a wall bounce.")
-        .defaultValue(3)
-        .min(1).max(8)
-        .sliderRange(1, 8)
-        .build());
-
     private final Setting<Boolean> frictionBypass = sgPacket.add(new BoolSetting.Builder()
         .name("friction-bypass")
         .description("Spoof onGround=false to server to prevent ground friction being applied.")
@@ -159,70 +148,15 @@ public class ElytraBouncePlus extends Module {
         .defaultValue(true)
         .build());
 
-    private final Setting<Integer> positionFlood = sgPacket.add(new IntSetting.Builder()
-        .name("position-flood")
-        .description("Extra position packets sent per tick ahead of the player on the highway axis.")
-        .defaultValue(4)
-        .min(1).max(10)
-        .sliderRange(1, 10)
-        .build());
-
-    private final Setting<Double> floodStepSize = sgPacket.add(new DoubleSetting.Builder()
-        .name("flood-step-size")
-        .description("Distance per flooded position packet ahead of the player.")
-        .defaultValue(0.2)
-        .min(0.05).max(1.0)
-        .sliderRange(0.05, 1.0)
-        .build());
-
-    // ─── Packet Desync ────────────────────────────────────────────────────────
-
-    private final Setting<Boolean> packetDesync = sgDesync.add(new BoolSetting.Builder()
-        .name("packet-desync")
-        .description("Modify the existing movement packet instead of sending extra ones (lower packet footprint).")
-        .defaultValue(false)
-        .visible(() -> packetBounce.get())
-        .build());
+    // ─── Packet Desync (the only packet path — see class javadoc) ───────────────
 
     private final Setting<Double> desyncStrength = sgDesync.add(new DoubleSetting.Builder()
         .name("desync-strength")
-        .description("How far ahead to nudge the intercepted position packet each tick.")
+        .description("How far ahead to nudge the intercepted movement packet each tick.")
         .defaultValue(0.15)
         .min(0.01).max(0.5)
         .sliderRange(0.01, 0.5)
-        .visible(() -> packetBounce.get() && packetDesync.get())
-        .build());
-
-    private final Setting<Boolean> groundPhaseDesync = sgDesync.add(new BoolSetting.Builder()
-        .name("ground-phase")
-        .description("Dip Y in the intercepted packet to trigger inside-solid velocity bypass.")
-        .defaultValue(true)
-        .visible(() -> packetBounce.get() && packetDesync.get())
-        .build());
-
-    private final Setting<Double> groundPhaseDip = sgDesync.add(new DoubleSetting.Builder()
-        .name("ground-phase-dip")
-        .description("How far below ground to dip in the intercepted packet.")
-        .defaultValue(0.05)
-        .min(0.01).max(0.15)
-        .sliderRange(0.01, 0.15)
-        .visible(() -> packetBounce.get() && packetDesync.get() && groundPhaseDesync.get())
-        .build());
-
-    private final Setting<Boolean> yStagger = sgDesync.add(new BoolSetting.Builder()
-        .name("y-stagger")
-        .description("Alternate Y slightly each tick to confuse position validation.")
-        .defaultValue(true)
-        .visible(() -> packetBounce.get() && packetDesync.get())
-        .build());
-
-    private final Setting<Double> yStaggerAmount = sgDesync.add(new DoubleSetting.Builder()
-        .name("y-stagger-amount")
-        .description("Y stagger magnitude per tick.")
-        .defaultValue(0.02)
-        .min(0.005).max(0.08)
-        .sliderRange(0.005, 0.08)
-        .visible(() -> packetBounce.get() && packetDesync.get() && yStagger.get())
+        .visible(() -> packetBounce.get())
         .build());
 
     // ─── State ────────────────────────────────────────────────────────────────
@@ -230,10 +164,11 @@ public class ElytraBouncePlus extends Module {
     private Vec3    lastPos            = null;
     private Vec3    bounceLastPos      = null;
     private boolean packetBounceActive = false;
-    private boolean staggerUp          = true;
+    private boolean wasOnGround        = false;
+    private int     fallFlyCooldown    = 0;
 
     public ElytraBouncePlus() {
-        super(AddonTemplate.CATEGORY, "elytra-bounce-plus", "Elytra highway speed for diagonal and cardinal 2b2t tunnels.");
+        super(AddonTemplate.CATEGORY, "elytra-bounce-plus", "Elytra highway speed for diagonal and cardinal 2b2t tunnels. Uses single-packet desync (no flooding).");
     }
 
     /** Called by both mixins to gate all injections. Requires elytra to be worn. */
@@ -249,7 +184,8 @@ public class ElytraBouncePlus extends Module {
         lastPos            = mc.player.position();
         bounceLastPos      = mc.player.position();
         packetBounceActive = false;
-        staggerUp          = true;
+        fallFlyCooldown    = 0;
+        wasOnGround        = ((EntityAccessor) mc.player).isOnGroundAccessor();
         mc.player.setSprinting(true);
     }
 
@@ -259,30 +195,37 @@ public class ElytraBouncePlus extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null) return;
 
-        mc.player.setSprinting(true);
+        boolean onGround = ((EntityAccessor) mc.player).isOnGroundAccessor();
+        // Set sprint once on landing rather than every tick (redundant re-sends, ncrnu.md B.2.5).
+        if (onGround && !wasOnGround) mc.player.setSprinting(true);
 
         if (lockYaw.get()) ((EntityAccessor) mc.player).invokeSetYRot(yaw.get().floatValue());
         if (lockPitch.get()) ((EntityAccessor) mc.player).invokeSetXRot(pitch.get().floatValue());
 
-        if (((EntityAccessor) mc.player).isOnGroundAccessor()) {
+        if (onGround) {
             Vec3 ps = Utils.getPlayerSpeed();
             boolean shouldJump = !motionYBoost.get()
                 || new Vec3(ps.x, 0.0, ps.z).length() < speed.get();
             if (shouldJump) ((LivingEntityInvoker) mc.player).invokeJump();
         }
 
-        if (enabled()) {
-            mc.player.connection.send(new ServerboundPlayerCommandPacket(
-                mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+        // Edge-trigger elytra deploy: only re-send START_FALL_FLYING when not already gliding,
+        // and rate-limit it. Spamming the toggle every tick is abnormal and pointless (B.2.1).
+        if (fallFlyCooldown > 0) fallFlyCooldown--;
+        if (enabled() && !mc.player.isFallFlying() && fallFlyCooldown <= 0) {
+            if (PacketLimiter.send(new ServerboundPlayerCommandPacket(
+                    mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING))) {
+                fallFlyCooldown = FALL_FLY_COOLDOWN;
+            }
         }
 
         if (packetBounce.get()) {
             handlePacketBounce();
-            staggerUp = !staggerUp;
         } else {
             packetBounceActive = false;
         }
 
+        wasOnGround   = onGround;
         bounceLastPos = mc.player.position();
     }
 
@@ -311,53 +254,49 @@ public class ElytraBouncePlus extends Module {
 
         if (((EntityAccessor) mc.player).isOnGroundAccessor() && mc.player.isSprinting() && speedBps < speed.get()) {
             if (speedBps > 20 || tunnelBounce.get()) {
-                event.movement = new Vec3(event.movement.x, 0.0, event.movement.z);
                 Vec3 vel = mc.player.getDeltaMovement();
-                mc.player.setDeltaMovement(vel.x, 0.0, vel.z);
+                // Hysteresis: only zero Y when there's actual vertical motion to cancel.
+                // Zeroing an already-flat Y every tick is a no-op that causes stutter (B.2.3).
+                if (Math.abs(vel.y) > 0.1) {
+                    event.movement = new Vec3(event.movement.x, 0.0, event.movement.z);
+                    mc.player.setDeltaMovement(vel.x, 0.0, vel.z);
+                }
             }
         }
 
         lastPos = mc.player.position();
     }
 
-    // ─── Packet Desync — modify existing packet instead of flooding ───────────
+    // ─── Packet Desync — modify the single move packet the client already sends ──
+    // This is the ONLY packet path: zero extra packets, which is the only footprint that
+    // survives Grim on 2b2t. The old flood/burst paths have been removed (ncrnu.md B.2.2).
 
     @EventHandler
     private void onSendPacket(PacketEvent.Send event) {
         if (mc.player == null) return;
-        if (!packetBounce.get() || !packetDesync.get() || !packetBounceActive) return;
+        if (!packetBounce.get() || !packetBounceActive) return;
         if (!(event.packet instanceof ServerboundMovePlayerPacket)) return;
 
         IServerboundMovePlayerPacket iPacket = (IServerboundMovePlayerPacket) event.packet;
 
         Vec3 pos = mc.player.position();
         Vec3 vel = mc.player.getDeltaMovement();
-        HighwayAxis axis = detectHighwayAxis(pos, vel);
+        HighwayUtil.Axis axis = HighwayUtil.detect(pos, vel, HIGHWAY_TOLERANCE);
         double strength  = desyncStrength.get();
 
         double newX = iPacket.getX();
-        double newY = iPacket.getY();
         double newZ = iPacket.getZ();
 
-        if (axis == HighwayAxis.X_AXIS) {
+        if (axis == HighwayUtil.Axis.X_AXIS) {
             newX += vel.x > 0 ? strength : -strength;
-        } else if (axis == HighwayAxis.Z_AXIS) {
+        } else if (axis == HighwayUtil.Axis.Z_AXIS) {
             newZ += vel.z > 0 ? strength : -strength;
         } else {
             double h = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
             if (h > 0) { newX += vel.x / h * strength; newZ += vel.z / h * strength; }
         }
 
-        if (groundPhaseDesync.get() && mc.player.onGround()) {
-            newY -= groundPhaseDip.get();
-        }
-
-        if (yStagger.get()) {
-            newY += staggerUp ? yStaggerAmount.get() : -yStaggerAmount.get();
-        }
-
         iPacket.setX(newX);
-        iPacket.setY(newY);
         iPacket.setZ(newZ);
         if (frictionBypass.get()) iPacket.setOnGround(false);
     }
@@ -384,24 +323,16 @@ public class ElytraBouncePlus extends Module {
         if (spd >= speedThreshold.get()) packetBounceActive = true;
         if (!packetBounceActive) return;
 
-        // Spoof onGround=false so server skips ground friction.
-        // In desync mode this is handled by onSendPacket modifying the existing packet.
-        if (frictionBypass.get() && mc.player.onGround() && !packetDesync.get()) {
-            mc.player.connection.send(new ServerboundMovePlayerPacket.PosRot(
-                currentPos.x, currentPos.y, currentPos.z,
-                mc.player.getYRot(), mc.player.getXRot(),
-                false, false
-            ));
-        }
+        // Friction bypass (onGround=false) is applied in onSendPacket by editing the single
+        // move packet — no extra packet is sent here.
 
-        HighwayAxis axis        = detectHighwayAxis(currentPos, velocity);
+        HighwayUtil.Axis axis   = HighwayUtil.detect(currentPos, velocity, HIGHWAY_TOLERANCE);
         double desiredTickSpeed = targetSpeed.get() / 20.0;
         double boost            = wallBoostMultiplier.get();
-        double offset           = bounceOffsetStep.get();
         double newVx            = velocity.x;
         double newVz            = velocity.z;
 
-        if (axis == HighwayAxis.X_AXIS) {
+        if (axis == HighwayUtil.Axis.X_AXIS) {
             if (againstWallZ) {
                 double sign = Math.signum(velocity.x) != 0
                     ? Math.signum(velocity.x) : Math.signum(currentPos.x);
@@ -415,7 +346,7 @@ public class ElytraBouncePlus extends Module {
                 newVz = 0;
             }
 
-        } else if (axis == HighwayAxis.Z_AXIS) {
+        } else if (axis == HighwayUtil.Axis.Z_AXIS) {
             if (againstWallX) {
                 double sign = Math.signum(velocity.z) != 0
                     ? Math.signum(velocity.z) : Math.signum(currentPos.z);
@@ -454,115 +385,7 @@ public class ElytraBouncePlus extends Module {
 
         double newVy = mc.player.onGround() ? 0.0 : velocity.y;
         mc.player.setDeltaMovement(newVx, newVy, newVz);
-        if (mc.player.onGround()) mc.player.setSprinting(true);
-
-        // In desync mode the existing packet is modified in onSendPacket — skip flooding.
-        if (!packetDesync.get()) {
-            if (mc.player.onGround() && mc.player.isSprinting()) {
-                sendGroundPhaseFlood(currentPos, newVx, newVz, axis);
-            } else {
-                sendAirFlood(currentPos, newVx, newVz, axis);
-            }
-        }
-
-        if (againstWall && !packetDesync.get()) {
-            for (int i = 0; i < packetBurst.get(); i++) {
-                mc.player.connection.send(new ServerboundMovePlayerPacket.PosRot(
-                    currentPos.x + (newVx * offset * (i + 1)),
-                    currentPos.y,
-                    currentPos.z + (newVz * offset * (i + 1)),
-                    mc.player.getYRot(), mc.player.getXRot(),
-                    false, false
-                ));
-            }
-        }
-    }
-
-    // Sends packets with Y slightly below ground surface to bypass velocity checks.
-    // A snap-back packet at real Y resyncs position after.
-    private void sendGroundPhaseFlood(Vec3 currentPos, double newVx, double newVz, HighwayAxis axis) {
-        int    flood = positionFlood.get();
-        double step  = floodStepSize.get();
-
-        for (int i = 1; i <= flood; i++) {
-            double floodX = currentPos.x;
-            double floodZ = currentPos.z;
-            double phaseY = currentPos.y - (0.05 * i);
-
-            if (axis == HighwayAxis.X_AXIS) {
-                floodX += newVx * step * i;
-            } else if (axis == HighwayAxis.Z_AXIS) {
-                floodZ += newVz * step * i;
-            } else {
-                floodX += newVx * step * i;
-                floodZ += newVz * step * i;
-            }
-
-            mc.player.connection.send(new ServerboundMovePlayerPacket.PosRot(
-                floodX, phaseY, floodZ,
-                mc.player.getYRot(), mc.player.getXRot(),
-                false, false
-            ));
-        }
-
-        mc.player.connection.send(new ServerboundMovePlayerPacket.PosRot(
-            currentPos.x, currentPos.y, currentPos.z,
-            mc.player.getYRot(), mc.player.getXRot(),
-            true, false
-        ));
-    }
-
-    private void sendAirFlood(Vec3 currentPos, double newVx, double newVz, HighwayAxis axis) {
-        int    flood = positionFlood.get();
-        double step  = floodStepSize.get();
-
-        for (int i = 1; i <= flood; i++) {
-            double floodX = currentPos.x;
-            double floodZ = currentPos.z;
-
-            if (axis == HighwayAxis.X_AXIS) {
-                floodX += newVx * step * i;
-            } else if (axis == HighwayAxis.Z_AXIS) {
-                floodZ += newVz * step * i;
-            } else {
-                floodX += newVx * step * i;
-                floodZ += newVz * step * i;
-            }
-
-            mc.player.connection.send(new ServerboundMovePlayerPacket.PosRot(
-                floodX, currentPos.y, floodZ,
-                mc.player.getYRot(), mc.player.getXRot(),
-                false, false
-            ));
-        }
-    }
-
-    // ─── Highway axis detection ───────────────────────────────────────────────
-
-    private HighwayAxis detectHighwayAxis(Vec3 pos, Vec3 vel) {
-        double absVx = Math.abs(vel.x);
-        double absVz = Math.abs(vel.z);
-
-        boolean movingAlongX = absVx > absVz * 3.0;
-        boolean movingAlongZ = absVz > absVx * 3.0;
-
-        if (!movingAlongX && !movingAlongZ) return HighwayAxis.NONE;
-
-        double tol = 5.0;
-
-        if (movingAlongX) {
-            double zOffset = Math.abs(pos.z % 1000);
-            if (zOffset < tol || zOffset > 1000 - tol) return HighwayAxis.X_AXIS;
-            if (Math.abs(pos.z) < tol) return HighwayAxis.X_AXIS;
-        }
-
-        if (movingAlongZ) {
-            double xOffset = Math.abs(pos.x % 1000);
-            if (xOffset < tol || xOffset > 1000 - tol) return HighwayAxis.Z_AXIS;
-            if (Math.abs(pos.x) < tol) return HighwayAxis.Z_AXIS;
-        }
-
-        if (movingAlongX) return HighwayAxis.X_AXIS;
-        return HighwayAxis.Z_AXIS;
+        // No flooding and no burst packets — the velocity set above plus the single-packet
+        // edit in onSendPacket is the entire effect. Sprint is set on landing in onTick.
     }
 }

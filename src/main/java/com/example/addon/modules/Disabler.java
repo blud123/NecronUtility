@@ -10,10 +10,6 @@ import net.minecraft.network.protocol.game.*;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-
 public class Disabler extends Module {
 
     private final SettingGroup sgGeneral  = settings.getDefaultGroup();
@@ -79,17 +75,9 @@ public class Disabler extends Module {
         .defaultValue(true)
         .build());
 
-    private final Setting<Boolean> teleportDesync = sgMethods.add(new BoolSetting.Builder()
-        .name("teleport-desync")
-        .description("Send stale teleport ACKs to keep Grim's position check window open.")
-        .defaultValue(false)
-        .build());
-
-    private final Setting<Boolean> bookPayload = sgMethods.add(new BoolSetting.Builder()
-        .name("book-payload")
-        .description("Send a large book packet to stall Grim's processing thread.")
-        .defaultValue(false)
-        .build());
+    // NOTE: the former `teleport-desync` (fabricated teleport ACKs) and `book-payload`
+    // (oversized edit-book packet) methods were removed — both are immediate ban triggers on
+    // 2b2t/Paper and neither defeats Grim's per-packet prediction (ncrnu.md B.5).
 
     // ═══════════════════════════════════════════
     //  TIMING
@@ -97,8 +85,8 @@ public class Disabler extends Module {
 
     private final Setting<Integer> pulseInterval = sgTiming.add(new IntSetting.Builder()
         .name("pulse-interval")
-        .description("Ticks between each disabler pulse.")
-        .defaultValue(5)
+        .description("Ticks between each disabler pulse. Higher = lower packet rate.")
+        .defaultValue(10)
         .min(1).max(40)
         .sliderRange(1, 40)
         .build());
@@ -106,25 +94,15 @@ public class Disabler extends Module {
     private final Setting<Integer> sprintToggleCount = sgTiming.add(new IntSetting.Builder()
         .name("sprint-toggle-count")
         .description("How many START/STOP sprint pairs to send per pulse.")
-        .defaultValue(2)
+        .defaultValue(1)
         .min(1).max(5)
         .sliderRange(1, 5)
         .visible(sprintToggle::get)
         .build());
 
-    private final Setting<Integer> bookPages = sgTiming.add(new IntSetting.Builder()
-        .name("book-pages")
-        .description("Number of max-length pages in the book payload packet.")
-        .defaultValue(40)
-        .min(1).max(100)
-        .sliderRange(1, 100)
-        .visible(bookPayload::get)
-        .build());
-
     public enum DisablerMode {
         SPRINT_ONLY,   // Sprint toggle only — safest, lowest packet count
         STATE_RESET,   // Swing + action + slot resets only
-        PAYLOAD,       // Book payload stall only
         COMBINED       // All enabled methods together
     }
 
@@ -133,7 +111,6 @@ public class Disabler extends Module {
     // ═══════════════════════════════════════════
 
     private int tickCounter  = 0;
-    private int teleportId   = 0;
 
     // ═══════════════════════════════════════════
     //  CONSTRUCTOR
@@ -141,7 +118,7 @@ public class Disabler extends Module {
 
     public Disabler() {
         super(com.example.addon.AddonTemplate.CATEGORY, "disabler",
-              "Disrupts Grim AntiCheat state tracking on 2b2t.");
+              "Sends sprint/state-reset packets. Does NOT defeat Grim's per-packet prediction; provided only as a low-noise state-reset. Off by default.");
     }
 
     // ═══════════════════════════════════════════
@@ -151,7 +128,6 @@ public class Disabler extends Module {
     @Override
     public void onActivate() {
         tickCounter = 0;
-        teleportId  = 0;
     }
 
     // ═══════════════════════════════════════════
@@ -174,13 +150,10 @@ public class Disabler extends Module {
         switch (mode.get()) {
             case SPRINT_ONLY  -> doSprintToggle();
             case STATE_RESET  -> doStateReset();
-            case PAYLOAD      -> doBookPayload();
             case COMBINED     -> {
                 if (sprintToggle.get())    doSprintToggle();
                 if (elytraToggle.get())    doElytraToggle();
                 doStateReset();
-                if (bookPayload.get())     doBookPayload();
-                if (teleportDesync.get())  doTeleportDesync();
             }
         }
     }
@@ -260,61 +233,12 @@ public class Disabler extends Module {
 
         // ── Slot cycle — forces movement modifier recalculation ──
         if (slotDesync.get()) {
-            int realSlot = mc.player.getInventory().selected;
+            int realSlot = mc.player.getInventory().getSelectedSlot();
             int fakeSlot = (realSlot + 1) % 9;
 
             mc.player.connection.send(new ServerboundSetCarriedItemPacket(fakeSlot));
             mc.player.connection.send(new ServerboundSetCarriedItemPacket(realSlot));
         }
 
-    }
-
-    // ═══════════════════════════════════════════
-    //  METHOD: BOOK PAYLOAD
-    //
-    //  Grim processes all incoming packets on a
-    //  single thread sequentially. A 40-page book
-    //  packet takes several milliseconds to parse,
-    //  stalling the thread and creating a window
-    //  where subsequent movement packets are queued
-    //  but not immediately checked.
-    // ═══════════════════════════════════════════
-
-    private void doBookPayload() {
-        if (mc.player == null) return;
-
-        int slot = mc.player.getInventory().selected;
-
-        List<String> pages = new ArrayList<>();
-        String fullPage = "A".repeat(255); // Max characters per page
-        for (int i = 0; i < bookPages.get(); i++) {
-            pages.add(fullPage);
-        }
-
-        mc.player.connection.send(new ServerboundEditBookPacket(
-            slot,
-            pages,
-            Optional.empty() // no title — avoids server-side validation
-        ));
-    }
-
-    // ═══════════════════════════════════════════
-    //  METHOD: TELEPORT DESYNC
-    //
-    //  Grim queues teleport confirmations and keeps
-    //  its position check window open until it
-    //  receives a matching ACK. Sending stale IDs
-    //  extends this window on the server side.
-    // ═══════════════════════════════════════════
-
-    private void doTeleportDesync() {
-        if (mc.player == null) return;
-
-        for (int i = 0; i < 3; i++) {
-            mc.player.connection.send(new ServerboundAcceptTeleportationPacket(teleportId++));
-        }
-
-        // Cap to prevent integer overflow
-        if (teleportId > 10_000) teleportId = 0;
     }
 }

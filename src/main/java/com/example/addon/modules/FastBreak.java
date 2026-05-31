@@ -21,8 +21,8 @@ import net.minecraft.client.Minecraft;
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
 /**
- * Takes over vanilla block breaking with packet-level control, automatic silent tool
- * selection (see {@link com.example.addon.mixin.SilentSwapMixin}) and optional double-break.
+ * Takes over vanilla block breaking with packet-level control and automatic silent tool
+ * selection (see {@link com.example.addon.mixin.SilentSwapMixin}).
  *
  * <p>It does NOT pick blocks itself — it reacts to {@link StartBreakingBlockEvent}, the event
  * Meteor fires whenever a block is left-clicked (manually, or by another module such as Nuker
@@ -32,9 +32,15 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * <h2>Protocol note (Mojang mappings, 1.21.8)</h2>
  * There is no {@code FINISH_DESTROY_BLOCK} action. Vanilla uses {@code STOP_DESTROY_BLOCK}
  * both to <em>complete</em> a break and to <em>hand off</em> a block to the server's single
- * "delayed destroy" slot (which keeps breaking it independently). That delayed slot is what
- * makes double-break possible: STOP the in-progress block (server demotes it to delayed and
- * keeps mining it), then START the next one.
+ * "delayed destroy" slot (which keeps breaking it independently). {@code ServerPlayerGameMode}
+ * tracks exactly one active destroy plus one delayed-destroy slot, so at most two blocks can be
+ * packet-mined at once — that is what {@code max-blocks} exposes.
+ *
+ * <h2>Tool sync</h2>
+ * The server recomputes {@code getDestroyProgress} every tick from whatever slot it believes you
+ * hold, so the tool must be synced to the server for the WHOLE break, not just near the finish.
+ * We send {@code ServerboundSetCarriedItemPacket} the moment a break starts and hold that server
+ * slot until every break finishes, then restore the real slot.
  */
 public class FastBreak extends Module {
 
@@ -50,24 +56,18 @@ public class FastBreak extends Module {
     private final SettingGroup sg       = settings.getDefaultGroup();
     private final SettingGroup sgRender = settings.createGroup("Render");
 
-    private final Setting<Boolean> doubleBreak = sg.add(new BoolSetting.Builder()
-        .name("double-break")
-        .description("Break a second block simultaneously while the first is in progress.")
-        .defaultValue(true)
+    private final Setting<Integer> maxBlocks = sg.add(new IntSetting.Builder()
+        .name("max-blocks")
+        .description("Max simultaneous packet breaks. 1 = primary only; 2 = allow the primary→delayed-slot demotion. The server only tracks one active + one delayed destroy, so 3+ are rejected.")
+        .defaultValue(2)
+        .min(1).max(2)
+        .sliderRange(1, 2)
         .build());
 
     private final Setting<Boolean> swapTool = sg.add(new BoolSetting.Builder()
         .name("swap-tool")
         .description("Silently swap to the best tool in your hotbar for each block.")
         .defaultValue(true)
-        .build());
-
-    private final Setting<Integer> serverSwapTicks = sg.add(new IntSetting.Builder()
-        .name("server-swap-ticks")
-        .description("How many ticks before finishing a break to sync the tool, giving the server time to process it.")
-        .defaultValue(2)
-        .min(0).max(5)
-        .sliderRange(0, 5)
         .build());
 
     private final Setting<Boolean> renderBreak = sgRender.add(new BoolSetting.Builder()
@@ -116,13 +116,19 @@ public class FastBreak extends Module {
         BlockPos pos;
         Direction face;
         int breakingTicks;
-        boolean secondary; // true = demoted by a new primary; server breaks it independently
+        boolean secondary;      // true = demoted by a new primary; server breaks it independently
 
-        MineTarget(BlockPos pos, Direction face, int breakingTicks, boolean secondary) {
+        // Render/timing estimate. estTicks is the number of ticks the break is expected to take;
+        // it doubles as the finish threshold. startMs anchors the smooth time-based render.
+        long startMs;
+        int estTicks = 1;
+        int estSlot = Integer.MIN_VALUE; // slot estTicks was last computed for; sentinel = uncomputed
+
+        MineTarget(BlockPos pos, Direction face, boolean secondary) {
             this.pos = pos;
             this.face = face;
-            this.breakingTicks = breakingTicks;
             this.secondary = secondary;
+            this.startMs = System.currentTimeMillis();
         }
     }
 
@@ -154,7 +160,6 @@ public class FastBreak extends Module {
         if (mc.player != null) {
             if (primary   != null) sendAbort(primary);
             if (secondary != null) sendAbort(secondary);
-            silentSlot = -1;
             restoreSlot();
         }
         primary   = null;
@@ -181,10 +186,14 @@ public class FastBreak extends Module {
         }
 
         if (primary != null) {
-            if (doubleBreak.get() && secondary == null) {
+            if (maxBlocks.get() >= 2 && secondary == null) {
                 // Demote the current primary to secondary: STOP_DESTROY_BLOCK hands it off to
                 // the server's delayed-destroy slot, so it keeps breaking independently.
-                secondary = new MineTarget(primary.pos, primary.face, primary.breakingTicks, true);
+                secondary = new MineTarget(primary.pos, primary.face, true);
+                secondary.breakingTicks = primary.breakingTicks;
+                secondary.startMs  = primary.startMs;
+                secondary.estTicks = primary.estTicks;
+                secondary.estSlot  = primary.estSlot;
                 sendStop(secondary);
             } else {
                 // No room for another simultaneous break — drop the old primary.
@@ -193,8 +202,11 @@ public class FastBreak extends Module {
             }
         }
 
-        primary = new MineTarget(pos, face, 0, false);
+        primary = new MineTarget(pos, face, false);
         sendStart(primary);
+        // Sync the tool to the server at the moment the break starts and hold it for the whole break.
+        int bestSlot = swapTool.get() ? findBestToolSlot(state) : -1;
+        syncServerSlot(bestSlot != -1 ? bestSlot : mc.player.getInventory().getSelectedSlot());
         event.setCancelled(true);
     }
 
@@ -204,12 +216,13 @@ public class FastBreak extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.level == null) return;
 
-        // Process secondary first so its tool sync is ordered before the primary's.
+        // Process secondary first so the primary (the active destroy slot) wins the held server
+        // slot for this tick — that's the break the server is actively timing.
         if (secondary != null) secondary = tickTarget(secondary);
         if (primary   != null) primary   = tickTarget(primary);
 
-        // Restore the held item server-side after all work this tick.
-        restoreSlot();
+        // Once nothing is breaking, hand the real slot back to the server.
+        if (primary == null && secondary == null) restoreSlot();
     }
 
     /**
@@ -228,22 +241,20 @@ public class FastBreak extends Module {
         float breakDelta = getBreakDelta(state, target.pos, bestSlot);
         if (breakDelta <= 0) return target; // unbreakable with this tool
 
-        int ticksToFinish = (int) Math.ceil(1.0f / breakDelta);
+        // Lock the tick estimate at start; recompute only if the tool/state changes.
+        if (target.estSlot != bestSlot) {
+            target.estTicks = Math.max(1, (int) Math.ceil(1.0f / breakDelta));
+            target.estSlot  = bestSlot;
+        }
 
-        // Sync the tool to the server ahead of the finish so it has time to register the swap.
-        boolean nearFinish = target.breakingTicks >= ticksToFinish - serverSwapTicks.get();
-        if (bestSlot != -1 && nearFinish) applySilentSwap(bestSlot);
+        // Hold the tool on the server for the WHOLE break (syncServerSlot only sends on change).
+        syncServerSlot(bestSlot != -1 ? bestSlot : mc.player.getInventory().getSelectedSlot());
 
         target.breakingTicks++;
-        float progress = breakDelta * target.breakingTicks;
-
-        if (progress >= 1.0f) {
-            // Guarantee the correct tool is in the server's hand for the finishing packet.
-            if (bestSlot != -1) applySilentSwap(bestSlot);
+        if (target.breakingTicks >= target.estTicks) {
             sendFinish(target);
             // Do NOT remove the block client-side — let the server send the block update.
             // Optimistic removal before server confirmation is what causes ghost blocks.
-            restoreSlot();
             return null;
         }
 
@@ -303,12 +314,6 @@ public class FastBreak extends Module {
 
     // ── Silent swap helpers ───────────────────────────────────────────────
 
-    /** Sets the client-side override AND tells the server we're holding this slot. */
-    private void applySilentSwap(int slot) {
-        silentSlot = slot;
-        syncServerSlot(slot);
-    }
-
     /** Clears the override and restores the server's held item to the real selected slot. */
     private void restoreSlot() {
         silentSlot = -1;
@@ -352,9 +357,16 @@ public class FastBreak extends Module {
         BlockState state = mc.level.getBlockState(target.pos);
         if (state.isAir()) return;
 
-        int bestSlot = swapTool.get() ? findBestToolSlot(state) : -1;
-        float delta = breakDeltaForSlot(state, target.pos, bestSlot);
-        float progress = delta <= 0 ? 1.0f : Math.min(delta * target.breakingTicks, 1.0f);
+        // Time-based, tick-independent growth: the cube expands continuously from the block centre
+        // to the full 1×1×1 box over the break's estimated duration (50 ms per tick). Instant
+        // breaks (estTicks <= 1) just show the full box for their single frame.
+        float progress;
+        if (target.estTicks <= 1) {
+            progress = 1.0f;
+        } else {
+            float elapsed = System.currentTimeMillis() - target.startMs;
+            progress = Math.max(0.0f, Math.min(elapsed / (target.estTicks * 50.0f), 1.0f));
+        }
 
         Color side, line;
         if (rainbow.get()) {

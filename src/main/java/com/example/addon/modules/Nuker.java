@@ -14,6 +14,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
@@ -35,12 +36,12 @@ public class Nuker extends Module {
         .sliderRange(1.0, 6.0)
         .build());
 
-    private final Setting<Integer> blocksPerTick = sgGeneral.add(new IntSetting.Builder()
-        .name("blocks-per-tick")
-        .description("How many blocks to break per tick. Keep low on 2b2t (1-2).")
+    private final Setting<Integer> maxBlocks = sgGeneral.add(new IntSetting.Builder()
+        .name("max-blocks")
+        .description("Max simultaneous in-progress breaks. The server only tracks one active + one delayed destroy, so keep this 1-2 on 2b2t.")
         .defaultValue(2)
-        .min(1).max(4)
-        .sliderRange(1, 4)
+        .min(1).max(2)
+        .sliderRange(1, 2)
         .build());
 
     private final Setting<Boolean> rotate = sgGeneral.add(new BoolSetting.Builder()
@@ -65,6 +66,12 @@ public class Nuker extends Module {
         .name("only-exposed")
         .description("Only break blocks with at least one exposed face (faster, less suspicious).")
         .defaultValue(true)
+        .build());
+
+    private final Setting<SortMode> sortMode = sgGeneral.add(new EnumSetting.Builder<SortMode>()
+        .name("sort-mode")
+        .description("Order in which to target blocks.")
+        .defaultValue(SortMode.CLOSEST)
         .build());
 
     // — Filter —
@@ -120,32 +127,42 @@ public class Nuker extends Module {
         .visible(rainbow::get)
         .build());
 
-    private final Setting<SortMode> sortMode = sgGeneral.add(new EnumSetting.Builder<SortMode>()
-        .name("sort-mode")
-        .description("Order in which to target blocks.")
-        .defaultValue(SortMode.CLOSEST)
-        .build());
-
     public enum SortMode { CLOSEST, LOWEST, HIGHEST }
 
-    // Tick count per tracked block (all paths). Keyed eviction is done against the full
-    // in-range target set, so tick counts survive budget rotation (fix for Problem 1).
-    private final Map<BlockPos, Integer> miningTicks = new LinkedHashMap<>();
+    /** Per-block break state for a locked (started) break — the single source of truth for "locked" slots. */
+    private static class Mining {
+        int ticks;        // multi-tick progress accumulator (standalone path)
+        long startMs;     // anchor for the smooth time-based render
+        int estTicks = 1; // estimated ticks to finish; locked at start
 
-    // Blocks in the multi-tick standalone path that have had START_DESTROY_BLOCK sent.
-    // Re-sending START resets server-side progress, so we track and only send it once
-    // per block (fix for Problem 2).
-    private final Set<BlockPos> startedBreaks = new LinkedHashSet<>();
+        Mining(long startMs, int estTicks) {
+            this.startMs = startMs;
+            this.estTicks = estTicks;
+        }
+    }
 
-    // Render list: populated from startedBreaks + any per-tick budget targets, so the
-    // overlay shows all actively-tracked blocks rather than just the budget slice.
-    private final List<BlockPos> currentTargets = new ArrayList<>();
+    // Locked breaks: insertion-ordered so the oldest locks keep priority. This is the single
+    // source of truth for which blocks own a budget slot — selection always services these first
+    // and never preempts a mid-break block (sticky targets, ncrnu/v5 §3b).
+    private final Map<BlockPos, Mining> breaks = new LinkedHashMap<>();
 
+    // Reused per-tick scratch so the hot loop allocates no containers.
+    private final List<BlockPos> validTargets = new ArrayList<>();
+    private final Set<BlockPos> targetSet = new HashSet<>();
+    private final BlockPos.MutableBlockPos scratch = new BlockPos.MutableBlockPos();
+
+    // Precomputed radius offset sphere, ordered for the current sort mode. Rebuilt only when the
+    // radius or sort mode changes — the per-tick sweep just offsets these from the player origin.
+    private int[][] offsets = new int[0][];
+    private double cachedRadius = -1;
+    private SortMode cachedSort = null;
+
+    // Block-name cache so we don't call getName().getString() every tick.
+    private final Map<Block, String> nameCache = new HashMap<>();
     private String miningBlockName = "";
 
-    // True original slot before Nuker took over tool management in multi-tick mode.
-    // -1 means no override is active. We restore here rather than every tick so the
-    // server's per-tick mining progress calculation always sees the correct tool.
+    // Single held-slot tracker: the original slot to restore once every multi-tick break is done.
+    // -1 means Nuker is not currently holding a tool.
     private int savedSlot = -1;
 
     public Nuker() {
@@ -167,19 +184,17 @@ public class Nuker extends Module {
     @Override
     public void onDeactivate() {
         if (mc.player != null) {
-            for (BlockPos pos : startedBreaks) {
+            for (BlockPos pos : breaks.keySet()) {
                 mc.player.connection.send(new ServerboundPlayerActionPacket(
                     ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK,
                     pos, getFacing(pos)));
             }
             if (savedSlot != -1) {
                 mc.player.connection.send(new ServerboundSetCarriedItemPacket(savedSlot));
-                mc.player.getInventory().selected = savedSlot;
+                mc.player.getInventory().setSelectedSlot(savedSlot);
             }
         }
-        miningTicks.clear();
-        startedBreaks.clear();
-        currentTargets.clear();
+        breaks.clear();
         miningBlockName = "";
         savedSlot = -1;
     }
@@ -188,158 +203,168 @@ public class Nuker extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.level == null || mc.gameMode == null) return;
 
-        List<BlockPos> targets = collectTargets();
-        Set<BlockPos> targetSet = new HashSet<>(targets);
-
-        // Evict state for blocks that left the radius. Using the full target set (not the
-        // budget-capped slice) means blocks temporarily outside the budget keep their ticks.
-        miningTicks.keySet().removeIf(pos -> !targetSet.contains(pos));
-        startedBreaks.removeIf(pos -> !targetSet.contains(pos));
-
-        // If eviction emptied all in-progress breaks, restore the tool slot now.
-        if (savedSlot != -1 && startedBreaks.isEmpty()) {
-            mc.player.connection.send(new ServerboundSetCarriedItemPacket(savedSlot));
-            mc.player.getInventory().selected = savedSlot;
-            savedSlot = -1;
-        }
-
-        // Render list starts with all actively-started blocks so the overlay persists
-        // even when a started block rotates out of the current budget.
-        currentTargets.clear();
-        currentTargets.addAll(startedBreaks);
-
-        if (targets.isEmpty()) {
-            miningBlockName = "";
-            return;
-        }
+        collectTargets(); // fills validTargets (sort order) + targetSet (membership)
 
         FastBreak fastBreak = Modules.get().get(FastBreak.class);
         boolean useFastBreak = fastBreak != null && fastBreak.isActive();
 
-        int originalSlot = mc.player.getInventory().selected;
-
-        // Cap at 2 when delegating to FastBreak: it tracks primary + secondary only.
-        // Submitting a 3rd block causes it to abort the current primary.
-        int budget = useFastBreak ? Math.min(blocksPerTick.get(), 2) : blocksPerTick.get();
-
-        List<BlockPos> toBreak = new ArrayList<>();
-        for (BlockPos pos : targets) {
-            if (toBreak.size() >= budget) break;
-            if (shouldSkip(mc.level.getBlockState(pos))) continue;
-            toBreak.add(pos);
+        // 1) Evict locks that left the radius / turned to air. ABORT mid-break in the standalone
+        //    path (FastBreak owns its own packets, so don't double-abort there).
+        Iterator<Map.Entry<BlockPos, Mining>> it = breaks.entrySet().iterator();
+        while (it.hasNext()) {
+            BlockPos pos = it.next().getKey();
+            if (!targetSet.contains(pos)) {
+                if (!useFastBreak) {
+                    mc.player.connection.send(new ServerboundPlayerActionPacket(
+                        ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, pos, getFacing(pos)));
+                }
+                it.remove();
+            }
         }
 
-        if (toBreak.isEmpty()) {
+        // Once all multi-tick breaks are gone, hand the tool back.
+        if (savedSlot != -1 && breaks.isEmpty()) {
+            mc.player.connection.send(new ServerboundSetCarriedItemPacket(savedSlot));
+            mc.player.getInventory().setSelectedSlot(savedSlot);
+            savedSlot = -1;
+        }
+
+        if (validTargets.isEmpty()) {
             miningBlockName = "";
             return;
         }
 
-        // Sort by tool slot only in packet-mine mode (instant breaks, re-sorting is harmless).
-        // The multi-tick path must NOT re-sort every tick — that causes budget churn and
-        // prevents ticks accumulating on any one block (the root cause of Problem 2).
-        if (!useFastBreak && autoTool.get() && packetMine.get()) {
-            toBreak.sort(Comparator.comparingInt(p -> getBestToolSlot(mc.level.getBlockState(p))));
+        int budget = useFastBreak ? Math.min(maxBlocks.get(), 2) : maxBlocks.get();
+
+        // 2) Build the active set: every still-valid locked break first (never preempted), then
+        //    fill any free slots with the highest-priority new candidates.
+        List<BlockPos> active = new ArrayList<>(breaks.keySet()); // all current locks keep their slot
+        int freeSlots = budget - active.size();
+        if (freeSlots > 0) {
+            for (BlockPos pos : validTargets) {
+                if (freeSlots <= 0) break;
+                if (breaks.containsKey(pos) || active.contains(pos)) continue;
+                active.add(pos);
+                freeSlots--;
+            }
         }
 
-        miningBlockName = mc.level.getBlockState(toBreak.get(0)).getBlock().getName().getString();
+        if (active.isEmpty()) {
+            miningBlockName = "";
+            return;
+        }
 
-        int currentSlot = originalSlot;
-        for (BlockPos pos : toBreak) {
+        miningBlockName = cachedName(mc.level.getBlockState(active.get(0)).getBlock());
+
+        // Rotate once toward the first (highest-priority) target.
+        if (rotate.get()) {
+            BlockPos first = active.get(0);
+            Rotations.rotate(Rotations.getYaw(first), Rotations.getPitch(first));
+        }
+
+        int originalSlot = mc.player.getInventory().getSelectedSlot();
+        int currentSlot  = originalSlot;
+
+        for (BlockPos pos : active) {
             BlockState state = mc.level.getBlockState(pos);
             Direction face = getFacing(pos);
 
-            if (rotate.get()) Rotations.rotate(
-                Rotations.getYaw(pos), Rotations.getPitch(pos), null);
-
             if (useFastBreak) {
-                // FastBreak intercepts StartBreakingBlockEvent and takes full control:
-                // progress tracking, tool selection, and packet sending are all its job.
+                // FastBreak intercepts StartBreakingBlockEvent and owns everything (tool, packets,
+                // progress). We just keep feeding it the same locked positions each tick.
                 mc.gameMode.startDestroyBlock(pos, face);
-                miningTicks.merge(pos, 1, Integer::sum);
-                if (!currentTargets.contains(pos)) currentTargets.add(pos);
+                lock(pos, state, fastToolSlot(state));
+                continue;
+            }
 
+            // Nuker owns the break. Pick the tool, then decide instant vs multi-tick from speed.
+            int bestSlot = autoTool.get() ? getBestToolSlot(state) : currentSlot;
+            float delta = FastBreak.breakDeltaForSlot(state, pos, bestSlot);
+            boolean instant = packetMine.get() && delta >= 1.0f;
+
+            if (autoTool.get() && bestSlot != currentSlot) {
+                // Hold the tool across ticks for multi-tick breaks so the server's per-tick
+                // progress calc always sees it. Capture the true original slot once.
+                if (savedSlot == -1) savedSlot = originalSlot;
+                mc.player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
+                mc.player.getInventory().setSelectedSlot(bestSlot);
+                currentSlot = bestSlot;
+            }
+
+            if (instant) {
+                // One-tick break: START + STOP land in the same tick. Not a persistent lock.
+                mc.player.connection.send(new ServerboundPlayerActionPacket(
+                    ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
+                mc.player.connection.send(new ServerboundPlayerActionPacket(
+                    ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, pos, face));
             } else {
-                // Nuker owns the break — swap to the best tool.
-                if (autoTool.get()) {
-                    int toolSlot = getBestToolSlot(state);
-                    if (toolSlot != currentSlot) {
-                        // Capture the true original slot the first time we switch in multi-tick
-                        // mode. We hold the tool until the break is done rather than restoring
-                        // every tick, so the server's per-tick progress calc uses the right tool.
-                        if (!packetMine.get() && savedSlot == -1) savedSlot = originalSlot;
-                        mc.player.connection.send(new ServerboundSetCarriedItemPacket(toolSlot));
-                        mc.player.getInventory().selected = toolSlot;
-                        currentSlot = toolSlot;
-                    }
-                }
-
-                if (packetMine.get()) {
+                // Multi-tick: send START only once — re-sending resets server-side progress.
+                Mining m = breaks.get(pos);
+                if (m == null) {
                     mc.player.connection.send(new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
+                    m = lock(pos, state, bestSlot);
+                }
+                m.ticks++;
+                if (delta > 0 && delta * m.ticks >= 1.0f) {
                     mc.player.connection.send(new ServerboundPlayerActionPacket(
                         ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, pos, face));
-                    miningTicks.merge(pos, 1, Integer::sum);
-                    if (!currentTargets.contains(pos)) currentTargets.add(pos);
-
-                } else {
-                    // Send START only once — re-sending resets server-side progress.
-                    if (!startedBreaks.contains(pos)) {
-                        mc.player.connection.send(new ServerboundPlayerActionPacket(
-                            ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
-                        startedBreaks.add(pos);
-                        miningTicks.put(pos, 0);
-                        if (!currentTargets.contains(pos)) currentTargets.add(pos);
-                    }
-
-                    // Accumulate ticks and send STOP when the block has been mined long enough.
-                    int ticks = miningTicks.merge(pos, 1, Integer::sum);
-                    float delta = FastBreak.breakDeltaForSlot(state, pos, getBestToolSlot(state));
-
-                    if (delta > 0 && delta * ticks >= 1.0f) {
-                        mc.player.connection.send(new ServerboundPlayerActionPacket(
-                            ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, pos, face));
-                        startedBreaks.remove(pos);
-                        miningTicks.remove(pos);
-                        currentTargets.remove(pos);
-                        // Restore the slot once all multi-tick breaks are done.
-                        if (startedBreaks.isEmpty() && savedSlot != -1) {
-                            mc.player.connection.send(new ServerboundSetCarriedItemPacket(savedSlot));
-                            mc.player.getInventory().selected = savedSlot;
-                            savedSlot = -1;
-                        }
-                    }
+                    breaks.remove(pos);
                 }
             }
         }
 
-        // For instant (packet-mine) breaks: restore each tick — START+STOP land in the same
-        // tick so the tool only needs to be correct for that window.
-        // For multi-tick breaks: DON'T restore here. The server's per-tick progress calc
-        // runs after processing all packets, so restoring every tick means it always sees
-        // the wrong tool. We restore via savedSlot once the break completes or is evicted.
-        if (!useFastBreak && packetMine.get() && currentSlot != originalSlot) {
+        // Restore the held tool only when no multi-tick break is keeping it equipped.
+        if (!useFastBreak && breaks.isEmpty() && currentSlot != originalSlot) {
             mc.player.connection.send(new ServerboundSetCarriedItemPacket(originalSlot));
-            mc.player.getInventory().selected = originalSlot;
+            mc.player.getInventory().setSelectedSlot(originalSlot);
+            savedSlot = -1;
         }
+    }
+
+    /** Registers a lock for {@code pos} if absent, computing its render estimate once. */
+    private Mining lock(BlockPos pos, BlockState state, int toolSlot) {
+        Mining m = breaks.get(pos);
+        if (m != null) return m;
+        float delta = FastBreak.breakDeltaForSlot(state, pos, toolSlot);
+        int estTicks = delta <= 0 ? 1 : Math.max(1, (int) Math.ceil(1.0f / delta));
+        m = new Mining(System.currentTimeMillis(), estTicks);
+        breaks.put(pos, m);
+        return m;
+    }
+
+    /** Best hotbar tool slot as FastBreak would pick it (−1 = bare hand), for render estimates. */
+    private int fastToolSlot(BlockState state) {
+        int bestSlot = -1;
+        float bestSpeed = 1.0f;
+        for (int i = 0; i < 9; i++) {
+            float speed = mc.player.getInventory().getItem(i).getDestroySpeed(state);
+            if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
+        }
+        return bestSlot;
     }
 
     @EventHandler
     private void onRender(Render3DEvent event) {
-        if (!renderBlocks.get() || currentTargets.isEmpty()) return;
+        if (!renderBlocks.get() || breaks.isEmpty()) return;
         if (mc.player == null || mc.level == null) return;
 
-        for (BlockPos pos : currentTargets) {
-            int ticks = miningTicks.getOrDefault(pos, 0);
-            BlockState state = mc.level.getBlockState(pos);
-            int bestSlot = getBestToolSlot(state);
-            // Use the best hotbar tool's break speed, not the currently held one —
-            // that's the actual speed the block is being mined at.
-            float delta = FastBreak.breakDeltaForSlot(state, pos, bestSlot);
-            float progress = delta <= 0 ? 1.0f : Math.min(delta * ticks, 1.0f);
+        for (Map.Entry<BlockPos, Mining> e : breaks.entrySet()) {
+            BlockPos pos = e.getKey();
+            Mining m = e.getValue();
+            if (mc.level.getBlockState(pos).isAir()) continue;
+
+            // Smooth, tick-independent growth from the block centre to the full box (50 ms/tick).
+            float progress;
+            if (m.estTicks <= 1) {
+                progress = 1.0f;
+            } else {
+                float elapsed = System.currentTimeMillis() - m.startMs;
+                progress = Math.max(0.0f, Math.min(elapsed / (m.estTicks * 50.0f), 1.0f));
+            }
 
             Color side;
             Color line;
-
             if (rainbow.get()) {
                 float hue = (float) ((System.currentTimeMillis() / 1000.0 * rainbowSpeed.get()) % 1.0);
                 int rgb = java.awt.Color.HSBtoRGB(hue, 1.0f, 1.0f);
@@ -364,37 +389,58 @@ public class Nuker extends Module {
         }
     }
 
-    private List<BlockPos> collectTargets() {
-        List<BlockPos> list = new ArrayList<>();
-        double r = radius.get();
-        int ri = (int) Math.ceil(r);
-        Vec3 eye = mc.player.getEyePosition();
-        BlockPos origin = BlockPos.containing(eye);
+    // ── Target collection (precomputed offset sphere) ───────────────────────
 
+    private void collectTargets() {
+        rebuildOffsetsIfNeeded();
+
+        validTargets.clear();
+        targetSet.clear();
+
+        Vec3 eye = mc.player.getEyePosition();
+        int ox = (int) Math.floor(eye.x);
+        int oy = (int) Math.floor(eye.y);
+        int oz = (int) Math.floor(eye.z);
+
+        for (int[] off : offsets) {
+            scratch.set(ox + off[0], oy + off[1], oz + off[2]);
+            BlockState state = mc.level.getBlockState(scratch);
+            if (shouldSkip(state)) continue;
+            if (onlyExposed.get() && !hasExposedFace(scratch)) continue;
+            BlockPos pos = scratch.immutable();
+            validTargets.add(pos);
+            targetSet.add(pos);
+        }
+    }
+
+    /** Rebuilds the offset sphere only when the radius or sort mode changes. */
+    private void rebuildOffsetsIfNeeded() {
+        double r = radius.get();
+        SortMode mode = sortMode.get();
+        if (r == cachedRadius && mode == cachedSort) return;
+
+        int ri = (int) Math.ceil(r);
+        double r2 = r * r;
+        List<int[]> list = new ArrayList<>();
         for (int dx = -ri; dx <= ri; dx++) {
             for (int dy = -ri; dy <= ri; dy++) {
                 for (int dz = -ri; dz <= ri; dz++) {
-                    BlockPos pos = origin.offset(dx, dy, dz);
-                    BlockState state = mc.level.getBlockState(pos);
-                    if (state.isAir()) continue;
-                    double distSq = eye.distanceToSqr(
-                        pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-                    if (distSq > r * r) continue;
-                    if (onlyExposed.get() && !hasExposedFace(pos)) continue;
-                    list.add(pos);
+                    int distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq <= r2) list.add(new int[]{dx, dy, dz, distSq});
                 }
             }
         }
 
-        Vec3 sortEye = eye;
-        Comparator<BlockPos> comp = switch (sortMode.get()) {
-            case CLOSEST -> Comparator.comparingDouble(p ->
-                sortEye.distanceToSqr(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5));
-            case LOWEST  -> Comparator.comparingInt(BlockPos::getY);
-            case HIGHEST -> Comparator.comparingInt((BlockPos p) -> p.getY()).reversed();
+        Comparator<int[]> comp = switch (mode) {
+            case CLOSEST -> Comparator.<int[]>comparingInt(o -> o[3]);
+            case LOWEST  -> Comparator.<int[]>comparingInt(o -> o[1]);
+            case HIGHEST -> Comparator.<int[]>comparingInt(o -> o[1]).reversed();
         };
         list.sort(comp);
-        return list;
+
+        offsets = list.toArray(new int[0][]);
+        cachedRadius = r;
+        cachedSort = mode;
     }
 
     private boolean hasExposedFace(BlockPos pos) {
@@ -424,12 +470,16 @@ public class Nuker extends Module {
     }
 
     private int getBestToolSlot(BlockState state) {
-        int bestSlot = mc.player.getInventory().selected;
+        int bestSlot = mc.player.getInventory().getSelectedSlot();
         float bestSpeed = -1;
         for (int i = 0; i < 9; i++) {
             float speed = mc.player.getInventory().getItem(i).getDestroySpeed(state);
             if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
         }
         return bestSlot;
+    }
+
+    private String cachedName(Block block) {
+        return nameCache.computeIfAbsent(block, b -> b.getName().getString());
     }
 }
