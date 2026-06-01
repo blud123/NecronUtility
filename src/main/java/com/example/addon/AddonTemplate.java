@@ -4,6 +4,7 @@ import com.example.addon.commands.CommandExample;
 import com.example.addon.commands.LoadoutCommand;
 import com.example.addon.hud.HudExample;
 import com.example.addon.hud.ElytraDurabilityHud;
+import com.example.addon.hud.PacketTrackerHud;
 import com.example.addon.hud.VerticalVelocityHud;
 import com.example.addon.modules.Disabler;
 import com.example.addon.modules.ElytraBouncePlus;
@@ -12,12 +13,19 @@ import com.example.addon.modules.FastBreak;
 import com.example.addon.modules.ModuleExample;
 import com.example.addon.modules.NecronConfig;
 import com.example.addon.modules.Nuker;
+import com.example.addon.modules.movement.Ascend;
+import com.example.addon.modules.movement.Blink;
+import com.example.addon.modules.movement.MovementProbe;
+import com.example.addon.modules.movement.PacketLogger;
+import com.example.addon.modules.movement.PacketTracker;
 import com.example.addon.modules.movement.VelocityBoost;
+import com.example.addon.modules.movement.VerticalYBoost;
 import com.example.addon.modules.VerticalVelocityTracker;
 import com.example.addon.modules.player.AutoElytraRestock;
 import com.example.addon.modules.player.LoadoutSave;
 import com.example.addon.modules.player.PacketAntiKick;
 import com.example.addon.modules.render.ContainerPreview;
+import com.example.addon.modules.render.FpsBoost;
 import com.example.addon.utils.PacketLimiter;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.MeteorClient;
@@ -54,7 +62,13 @@ public class AddonTemplate extends MeteorAddon {
         Modules.get().add(new NecronConfig());
 
         // Movement
+        Modules.get().add(new Ascend());
+        Modules.get().add(new MovementProbe());
+        Modules.get().add(new Blink());
         Modules.get().add(new VelocityBoost());
+        Modules.get().add(new PacketTracker());
+        Modules.get().add(new PacketLogger());
+        Modules.get().add(new VerticalYBoost());
         Modules.get().add(new VerticalVelocityTracker());
 
         // Player / inventory
@@ -64,6 +78,7 @@ public class AddonTemplate extends MeteorAddon {
 
         // Render
         Modules.get().add(new ContainerPreview());
+        Modules.get().add(new FpsBoost());
 
         // Commands
         Commands.add(new CommandExample());
@@ -73,6 +88,7 @@ public class AddonTemplate extends MeteorAddon {
         Hud.get().register(HudExample.INFO);
         Hud.get().register(ElytraDurabilityHud.INFO);
         Hud.get().register(VerticalVelocityHud.INFO);
+        Hud.get().register(PacketTrackerHud.INFO);
     }
 
     @Override
