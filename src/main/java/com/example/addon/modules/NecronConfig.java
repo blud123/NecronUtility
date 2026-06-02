@@ -1,6 +1,6 @@
 package com.example.addon.modules;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.settings.StringSetting;
@@ -24,7 +24,7 @@ public class NecronConfig extends Module {
         .build());
 
     public NecronConfig() {
-        super(AddonTemplate.CATEGORY, "necron-config",
+        super(DWAddons.CATEGORY, "necron-config",
             "Global NecronUtility settings (fallback Discord webhook). Always-on config holder.");
         INSTANCE = this;
     }

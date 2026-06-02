@@ -10,14 +10,12 @@ import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
-import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.block.Block;
+import net.minecraft.block.Blocks;
+import net.minecraft.block.BlockState;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.*;
 
@@ -52,8 +50,15 @@ public class Nuker extends Module {
 
     private final Setting<Boolean> autoTool = sgGeneral.add(new BoolSetting.Builder()
         .name("auto-tool")
-        .description("Automatically switch to the best tool.")
+        .description("Let Nuker pick the best tool. Actual swapping is performed by FastBreak's swap-tool; this also gates swap-before.")
         .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> swapBefore = sgGeneral.add(new BoolSetting.Builder()
+        .name("swap-before")
+        .description("Sync the best tool to the server BEFORE the break starts, not just before it finishes.")
+        .defaultValue(false)
+        .visible(autoTool::get)
         .build());
 
     private final Setting<Boolean> packetMine = sgGeneral.add(new BoolSetting.Builder()
@@ -75,6 +80,24 @@ public class Nuker extends Module {
         .build());
 
     // — Filter —
+    private final Setting<Selection> selection = sgFilter.add(new EnumSetting.Builder<Selection>()
+        .name("selection")
+        .description("ALL = break everything; WHITELIST = only listed blocks; BLACKLIST = everything except listed blocks.")
+        .defaultValue(Selection.ALL)
+        .build());
+
+    private final Setting<List<Block>> whitelist = sgFilter.add(new BlockListSetting.Builder()
+        .name("whitelist")
+        .description("Only break these blocks (when selection = WHITELIST).")
+        .visible(() -> selection.get() == Selection.WHITELIST)
+        .build());
+
+    private final Setting<List<Block>> blacklist = sgFilter.add(new BlockListSetting.Builder()
+        .name("blacklist")
+        .description("Never break these blocks (when selection = BLACKLIST).")
+        .visible(() -> selection.get() == Selection.BLACKLIST)
+        .build());
+
     private final Setting<Boolean> filterBedrock = sgFilter.add(new BoolSetting.Builder()
         .name("skip-bedrock")
         .description("Skip bedrock (unbreakable on 2b2t).")
@@ -128,6 +151,7 @@ public class Nuker extends Module {
         .build());
 
     public enum SortMode { CLOSEST, LOWEST, HIGHEST }
+    public enum Selection { ALL, WHITELIST, BLACKLIST }
 
     /** Per-block break state for a locked (started) break — the single source of truth for "locked" slots. */
     private static class Mining {
@@ -149,7 +173,7 @@ public class Nuker extends Module {
     // Reused per-tick scratch so the hot loop allocates no containers.
     private final List<BlockPos> validTargets = new ArrayList<>();
     private final Set<BlockPos> targetSet = new HashSet<>();
-    private final BlockPos.MutableBlockPos scratch = new BlockPos.MutableBlockPos();
+    private final BlockPos.Mutable scratch = new BlockPos.Mutable();
 
     // Precomputed radius offset sphere, ordered for the current sort mode. Rebuilt only when the
     // radius or sort mode changes — the per-tick sweep just offsets these from the player origin.
@@ -161,12 +185,11 @@ public class Nuker extends Module {
     private final Map<Block, String> nameCache = new HashMap<>();
     private String miningBlockName = "";
 
-    // The slot currently synced to the server by Nuker. Initialized to the real selected slot at
-    // activate time so nukerSyncSlot() only sends a packet when it actually changes.
-    private int lastServerSlot = -1;
+    // Warn-once latch when FastBreak isn't available to drive breaking.
+    private boolean warnedNoFastBreak = false;
 
     public Nuker() {
-        super(com.example.addon.AddonTemplate.CATEGORY, "nuker",
+        super(com.example.addon.DWAddons.CATEGORY, "nuker",
             "Breaks all blocks in a circle. Tuned for 2b2t lag.");
     }
 
@@ -177,57 +200,59 @@ public class Nuker extends Module {
 
     @Override
     public void onActivate() {
-        lastServerSlot = mc.player != null ? mc.player.getInventory().getSelectedSlot() : 0;
+        breaks.clear();
+        miningBlockName = "";
+        warnedNoFastBreak = false;
     }
 
-    // Abort in-progress breaks and restore the server slot when the module is disabled.
+    // Abort in-progress breaks (via FastBreak, which owns the packets) when the module is disabled.
     @Override
     public void onDeactivate() {
-        if (mc.player != null) {
-            for (BlockPos pos : breaks.keySet()) {
-                mc.player.connection.send(new ServerboundPlayerActionPacket(
-                    ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK,
-                    pos, getFacing(pos)));
-            }
-            nukerSyncSlot(mc.player.getInventory().getSelectedSlot());
+        FastBreak fastBreak = Modules.get().get(FastBreak.class);
+        if (fastBreak != null && fastBreak.isActive()) {
+            for (BlockPos pos : breaks.keySet()) fastBreak.cancelBreak(pos);
         }
         breaks.clear();
         miningBlockName = "";
-        lastServerSlot = -1;
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.level == null || mc.gameMode == null) return;
+        if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
+
+        // Single source of truth: Nuker selects targets, FastBreak owns the break engine (tool sync
+        // + packets). Without an active FastBreak there is nothing to drive the breaks.
+        FastBreak fastBreak = Modules.get().get(FastBreak.class);
+        if (fastBreak == null || !fastBreak.isActive()) {
+            if (!warnedNoFastBreak) {
+                warning("Enable FastBreak — Nuker now drives its break engine instead of sending its own packets.");
+                warnedNoFastBreak = true;
+            }
+            breaks.clear();
+            miningBlockName = "";
+            return;
+        }
+        warnedNoFastBreak = false;
 
         collectTargets(); // fills validTargets (sort order) + targetSet (membership)
 
-        FastBreak fastBreak = Modules.get().get(FastBreak.class);
-        boolean useFastBreak = fastBreak != null && fastBreak.isActive();
-
-        // Evict locks that left the radius / turned to air. ABORT in standalone path only —
-        // FastBreak owns its own packets when active.
+        // Evict locks that left the radius / turned to air, telling FastBreak to abort each.
         Iterator<Map.Entry<BlockPos, Mining>> it = breaks.entrySet().iterator();
         while (it.hasNext()) {
             BlockPos pos = it.next().getKey();
             if (!targetSet.contains(pos)) {
-                if (!useFastBreak) {
-                    mc.player.connection.send(new ServerboundPlayerActionPacket(
-                        ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, pos, getFacing(pos)));
-                }
+                fastBreak.cancelBreak(pos);
                 it.remove();
             }
         }
 
-        int realSlot = mc.player.getInventory().getSelectedSlot();
-
         if (validTargets.isEmpty()) {
-            if (!useFastBreak) nukerSyncSlot(realSlot); // restore server slot if no targets
             miningBlockName = "";
             return;
         }
 
-        int budget = useFastBreak ? Math.min(maxBlocks.get(), 2) : maxBlocks.get();
+        // FastBreak tracks one active + one delayed destroy, so the multi-tick budget is at most 2.
+        int budget = Math.min(maxBlocks.get(), 2);
 
         // Build the active set: every still-valid locked break first (never preempted), then
         // fill any free slots with the highest-priority new candidates.
@@ -243,77 +268,39 @@ public class Nuker extends Module {
         }
 
         if (active.isEmpty()) {
-            if (!useFastBreak) nukerSyncSlot(realSlot);
             miningBlockName = "";
             return;
         }
 
-        miningBlockName = cachedName(mc.level.getBlockState(active.get(0)).getBlock());
+        miningBlockName = cachedName(mc.world.getBlockState(active.get(0)).getBlock());
 
-        // Rotate once toward the first (highest-priority) target.
+        // Rotate once toward the first (highest-priority) target, via Meteor's shared Rotations.
         if (rotate.get()) {
             BlockPos first = active.get(0);
             Rotations.rotate(Rotations.getYaw(first), Rotations.getPitch(first));
         }
 
-        // Standalone path: sync the best tool for the PRIMARY block to the server and hold it for
-        // ALL breaks this tick. Do NOT switch per-block — the server credits every locked break
-        // from the single held slot each tick. nukerSyncSlot() only sends a packet on change.
-        if (!useFastBreak && autoTool.get()) {
-            int bestSlot = getBestToolSlot(mc.level.getBlockState(active.get(0)));
-            nukerSyncSlot(bestSlot);
-        }
-
         for (BlockPos pos : active) {
-            BlockState state = mc.level.getBlockState(pos);
+            BlockState state = mc.world.getBlockState(pos);
             Direction face = getFacing(pos);
 
-            if (useFastBreak) {
-                // FastBreak intercepts StartBreakingBlockEvent and owns everything (tool, packets,
-                // progress). We just keep feeding it the same locked positions each tick.
-                mc.gameMode.startDestroyBlock(pos, face);
-                lock(pos, state, fastToolSlot(state));
-                continue;
-            }
+            // Swap-before: pre-sync the tool through FastBreak ahead of its START packet.
+            if (swapBefore.get() && autoTool.get()) fastBreak.syncToolFor(state, pos);
 
-            // Estimate break speed using the slot currently held on the server.
-            float delta = FastBreak.breakDeltaForSlot(state, pos, lastServerSlot);
-            boolean instant = packetMine.get() && delta >= 1.0f;
+            // Estimate using the exact slot FastBreak will hold, so instant detection matches reality.
+            int toolSlot = fastBreak.effectiveToolSlot(state, pos);
+            float delta = FastBreak.breakDeltaForSlot(state, pos, toolSlot);
 
-            if (instant) {
-                // One-tick break: START + STOP in the same tick. Not a persistent lock.
-                mc.player.connection.send(new ServerboundPlayerActionPacket(
-                    ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
-                mc.player.connection.send(new ServerboundPlayerActionPacket(
-                    ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, pos, face));
+            if (packetMine.get() && delta >= 1.0f) {
+                // Instant fast path: one-shot START+STOP through FastBreak. Not a persistent lock.
+                fastBreak.packetBreak(pos, face);
+                breaks.remove(pos);
             } else {
-                // Multi-tick: send START only once — re-sending resets server-side progress.
-                Mining m = breaks.get(pos);
-                if (m == null) {
-                    mc.player.connection.send(new ServerboundPlayerActionPacket(
-                        ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, pos, face));
-                    m = lock(pos, state, lastServerSlot);
-                }
-                m.ticks++;
-                if (delta > 0 && delta * m.ticks >= 1.0f) {
-                    mc.player.connection.send(new ServerboundPlayerActionPacket(
-                        ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, pos, face));
-                    breaks.remove(pos);
-                }
+                // Multi-tick: keep feeding the same position; FastBreak no-ops once it is tracking it.
+                lock(pos, state, toolSlot); // render estimate only
+                fastBreak.requestBreak(pos, face);
             }
         }
-
-        // Restore the server slot when no multi-tick breaks remain (instant-only tick, or final STOP).
-        if (!useFastBreak && breaks.isEmpty()) {
-            nukerSyncSlot(realSlot);
-        }
-    }
-
-    /** Sends SetCarriedItem to the server only when the slot actually changes, keeping churn minimal. */
-    private void nukerSyncSlot(int slot) {
-        if (mc.player == null || slot == lastServerSlot) return;
-        mc.player.connection.send(new ServerboundSetCarriedItemPacket(slot));
-        lastServerSlot = slot;
     }
 
     /** Registers a lock for {@code pos} if absent, computing its render estimate once. */
@@ -327,26 +314,15 @@ public class Nuker extends Module {
         return m;
     }
 
-    /** Best hotbar tool slot as FastBreak would pick it (−1 = bare hand), for render estimates. */
-    private int fastToolSlot(BlockState state) {
-        int bestSlot = -1;
-        float bestSpeed = 1.0f;
-        for (int i = 0; i < 9; i++) {
-            float speed = mc.player.getInventory().getItem(i).getDestroySpeed(state);
-            if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
-        }
-        return bestSlot;
-    }
-
     @EventHandler
     private void onRender(Render3DEvent event) {
         if (!renderBlocks.get() || breaks.isEmpty()) return;
-        if (mc.player == null || mc.level == null) return;
+        if (mc.player == null || mc.world == null) return;
 
         for (Map.Entry<BlockPos, Mining> e : breaks.entrySet()) {
             BlockPos pos = e.getKey();
             Mining m = e.getValue();
-            if (mc.level.getBlockState(pos).isAir()) continue;
+            if (mc.world.getBlockState(pos).isAir()) continue;
 
             // Smooth, tick-independent growth from the block centre to the full box (50 ms/tick).
             float progress;
@@ -391,17 +367,17 @@ public class Nuker extends Module {
         validTargets.clear();
         targetSet.clear();
 
-        Vec3 eye = mc.player.getEyePosition();
+        Vec3d eye = mc.player.getEyePos();
         int ox = (int) Math.floor(eye.x);
         int oy = (int) Math.floor(eye.y);
         int oz = (int) Math.floor(eye.z);
 
         for (int[] off : offsets) {
             scratch.set(ox + off[0], oy + off[1], oz + off[2]);
-            BlockState state = mc.level.getBlockState(scratch);
+            BlockState state = mc.world.getBlockState(scratch);
             if (shouldSkip(state)) continue;
             if (onlyExposed.get() && !hasExposedFace(scratch)) continue;
-            BlockPos pos = scratch.immutable();
+            BlockPos pos = scratch.toImmutable();
             validTargets.add(pos);
             targetSet.add(pos);
         }
@@ -439,21 +415,27 @@ public class Nuker extends Module {
 
     private boolean hasExposedFace(BlockPos pos) {
         for (Direction dir : Direction.values()) {
-            if (mc.level.getBlockState(pos.relative(dir)).isAir()) return true;
+            if (mc.world.getBlockState(pos.offset(dir)).isAir()) return true;
         }
         return false;
     }
 
     private boolean shouldSkip(BlockState state) {
         if (state.isAir()) return true;
-        if (filterBedrock.get() && state.getBlock() == Blocks.BEDROCK) return true;
-        if (filterFluids.get() &&
-            (state.getBlock() == Blocks.WATER || state.getBlock() == Blocks.LAVA)) return true;
+        Block block = state.getBlock();
+        if (filterBedrock.get() && block == Blocks.BEDROCK) return true;
+        if (filterFluids.get() && (block == Blocks.WATER || block == Blocks.LAVA)) return true;
+        // Whitelist/blacklist selection mode, applied on top of the bedrock/fluid filters.
+        switch (selection.get()) {
+            case WHITELIST -> { if (!whitelist.get().contains(block)) return true; }
+            case BLACKLIST -> { if (blacklist.get().contains(block)) return true; }
+            case ALL -> { /* break everything not already filtered */ }
+        }
         return false;
     }
 
     private Direction getFacing(BlockPos pos) {
-        Vec3 eye = mc.player.getEyePosition();
+        Vec3d eye = mc.player.getEyePos();
         double dx = eye.x - (pos.getX() + 0.5);
         double dy = eye.y - (pos.getY() + 0.5);
         double dz = eye.z - (pos.getZ() + 0.5);
@@ -461,16 +443,6 @@ public class Nuker extends Module {
         if (ay >= ax && ay >= az) return dy > 0 ? Direction.UP : Direction.DOWN;
         if (ax >= az) return dx > 0 ? Direction.EAST : Direction.WEST;
         return dz > 0 ? Direction.SOUTH : Direction.NORTH;
-    }
-
-    private int getBestToolSlot(BlockState state) {
-        int bestSlot = mc.player.getInventory().getSelectedSlot();
-        float bestSpeed = -1;
-        for (int i = 0; i < 9; i++) {
-            float speed = mc.player.getInventory().getItem(i).getDestroySpeed(state);
-            if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
-        }
-        return bestSlot;
     }
 
     private String cachedName(Block block) {

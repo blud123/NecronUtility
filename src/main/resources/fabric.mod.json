@@ -1,25 +1,25 @@
 {
   "schemaVersion": 1,
-  "id": "addon-template",
+  "id": "dw-addons",
   "version": "${version}",
-  "name": "Addon Template",
-  "description": "An addon template for Meteor Client addons.",
+  "name": "DW Addons",
+  "description": "DW Addons for Meteor Client.",
   "authors": [
-    "seasnail"
+    "deWinter"
   ],
   "contact": {
-    "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
+    "sources": "https://github.com/deWinterr/NecronUtility"
   },
-  "icon": "assets/template/icon.png",
-  "accessWidener": "addon-template.accesswidener",
+  "icon": "assets/dw-addons/icon.png",
+  "accessWidener": "dw-addons.accesswidener",
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
+      "com.example.addon.DWAddons"
     ]
   },
   "mixins": [
-    "addon-template.mixins.json"
+    "dw-addons.mixins.json"
   ],
   "custom": {
     "meteor-client:color": "225,25,25",

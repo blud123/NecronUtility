@@ -1,8 +1,6 @@
 package com.example.addon;
 
-import com.example.addon.commands.CommandExample;
 import com.example.addon.commands.LoadoutCommand;
-import com.example.addon.hud.HudExample;
 import com.example.addon.hud.ElytraDurabilityHud;
 import com.example.addon.hud.PacketTrackerHud;
 import com.example.addon.hud.VerticalVelocityHud;
@@ -10,7 +8,6 @@ import com.example.addon.modules.Disabler;
 import com.example.addon.modules.ElytraBouncePlus;
 import com.example.addon.modules.ElytraFlyPlusPlus;
 import com.example.addon.modules.FastBreak;
-import com.example.addon.modules.ModuleExample;
 import com.example.addon.modules.NecronConfig;
 import com.example.addon.modules.Nuker;
 import com.example.addon.modules.movement.Ascend;
@@ -18,6 +15,7 @@ import com.example.addon.modules.movement.Blink;
 import com.example.addon.modules.movement.MovementProbe;
 import com.example.addon.modules.movement.PacketLogger;
 import com.example.addon.modules.movement.PacketTracker;
+import com.example.addon.modules.movement.RubberbandLogger;
 import com.example.addon.modules.movement.VelocityBoost;
 import com.example.addon.modules.movement.VerticalYBoost;
 import com.example.addon.modules.VerticalVelocityTracker;
@@ -38,20 +36,19 @@ import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import org.slf4j.Logger;
 
-public class AddonTemplate extends MeteorAddon {
+public class DWAddons extends MeteorAddon {
     public static final Logger LOG = LogUtils.getLogger();
-    public static final Category CATEGORY = new Category("Example");
-    public static final HudGroup HUD_GROUP = new HudGroup("Example");
+    public static final Category CATEGORY = new Category("DW Addons");
+    public static final HudGroup HUD_GROUP = new HudGroup("DW Addons");
 
     @Override
     public void onInitialize() {
-        LOG.info("Initializing Meteor Addon Template");
+        LOG.info("Initializing DW Addons");
 
         // Global per-tick packet budget reset (safety net shared by all modules).
         MeteorClient.EVENT_BUS.subscribe(PacketLimiter.class);
 
-        // Existing modules
-        Modules.get().add(new ModuleExample());
+        // Combat / world
         Modules.get().add(new Nuker());
         Modules.get().add(new FastBreak());
         Modules.get().add(new ElytraBouncePlus());
@@ -68,6 +65,7 @@ public class AddonTemplate extends MeteorAddon {
         Modules.get().add(new VelocityBoost());
         Modules.get().add(new PacketTracker());
         Modules.get().add(new PacketLogger());
+        Modules.get().add(new RubberbandLogger());
         Modules.get().add(new VerticalYBoost());
         Modules.get().add(new VerticalVelocityTracker());
 
@@ -81,11 +79,9 @@ public class AddonTemplate extends MeteorAddon {
         Modules.get().add(new FpsBoost());
 
         // Commands
-        Commands.add(new CommandExample());
         Commands.add(new LoadoutCommand());
 
         // HUD
-        Hud.get().register(HudExample.INFO);
         Hud.get().register(ElytraDurabilityHud.INFO);
         Hud.get().register(VerticalVelocityHud.INFO);
         Hud.get().register(PacketTrackerHud.INFO);
@@ -103,6 +99,6 @@ public class AddonTemplate extends MeteorAddon {
 
     @Override
     public GithubRepo getRepo() {
-        return new GithubRepo("MeteorDevelopment", "meteor-addon-template");
+        return new GithubRepo("deWinterr", "NecronUtility");
     }
 }

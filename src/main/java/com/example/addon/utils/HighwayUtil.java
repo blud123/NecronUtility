@@ -1,6 +1,6 @@
 package com.example.addon.utils;
 
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.util.math.Vec3d;
 
 /**
  * Shared cardinal-highway detection for the movement modules.
@@ -23,7 +23,7 @@ public final class HighwayUtil {
      * @param tol how close (blocks) to the x=0 / z=0 centerline counts as "on the highway"
      * @return the highway axis the player is travelling along, or {@link Axis#NONE}
      */
-    public static Axis detect(Vec3 pos, Vec3 vel, double tol) {
+    public static Axis detect(Vec3d pos, Vec3d vel, double tol) {
         double absVx = Math.abs(vel.x);
         double absVz = Math.abs(vel.z);
 

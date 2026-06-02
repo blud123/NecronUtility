@@ -3,7 +3,7 @@ package com.example.addon.utils;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
-import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.packet.Packet;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -12,7 +12,7 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * Necron module. It is a safety net — modules still keep their own per-module limits — so
  * that even if two modules run at once the addon can never exceed a sane packet rate.
  *
- * <p>Wired in {@link com.example.addon.AddonTemplate#onInitialize()} by subscribing this
+ * <p>Wired in {@link com.example.addon.DWAddons#onInitialize()} by subscribing this
  * class to Meteor's event bus; {@link #onTick} resets the counter once per tick at
  * {@link EventPriority#HIGHEST} so the reset always runs before any module consumes budget.
  */
@@ -27,9 +27,9 @@ public final class PacketLimiter {
 
     /** Returns true if the packet was sent, false if the per-tick budget is exhausted. */
     public static boolean send(Packet<?> packet) {
-        if (mc.player == null || mc.player.connection == null) return false;
+        if (mc.player == null || mc.player.networkHandler == null) return false;
         if (sentThisTick >= maxPerTick) return false;
-        mc.player.connection.send(packet);
+        mc.player.networkHandler.sendPacket(packet);
         sentThisTick++;
         return true;
     }

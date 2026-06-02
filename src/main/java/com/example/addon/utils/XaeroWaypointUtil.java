@@ -1,8 +1,8 @@
 package com.example.addon.utils;
 
 import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.multiplayer.ServerData;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ServerInfo;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -37,9 +37,9 @@ public final class XaeroWaypointUtil {
     }
 
     private static Path resolveDir(int dimension) {
-        Minecraft mc = Minecraft.getInstance();
-        ServerData sd = mc.getCurrentServer();
-        String server = (sd != null) ? "Multiplayer_" + sd.ip.replace(':', '_') : "Singleplayer";
+        MinecraftClient mc = MinecraftClient.getInstance();
+        ServerInfo sd = mc.getCurrentServerEntry();
+        String server = (sd != null) ? "Multiplayer_" + sd.address.replace(':', '_') : "Singleplayer";
         String dim = switch (dimension) {
             case -1 -> "dim%-1";
             case 1  -> "dim%1";

@@ -1,6 +1,6 @@
 package com.example.addon.modules.movement;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
@@ -90,7 +90,7 @@ public class MovementProbe extends Module {
     private BufferedWriter writer;
 
     public MovementProbe() {
-        super(AddonTemplate.CATEGORY, "movement-probe",
+        super(DWAddons.CATEGORY, "movement-probe",
             "Instruments packets and per-tick motion to reverse-engineer when and why the server reacts.");
     }
 

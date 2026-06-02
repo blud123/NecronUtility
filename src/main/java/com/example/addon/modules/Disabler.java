@@ -5,18 +5,18 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
-import net.minecraft.network.protocol.common.ClientboundPingPacket;
-import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
-import net.minecraft.network.protocol.common.ServerboundPongPacket;
-import net.minecraft.network.protocol.game.*;
-import net.minecraft.world.InteractionHand;
-import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.player.Input;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.network.packet.s2c.common.KeepAliveS2CPacket;
+import net.minecraft.network.packet.s2c.common.CommonPingS2CPacket;
+import net.minecraft.network.packet.c2s.common.KeepAliveC2SPacket;
+import net.minecraft.network.packet.c2s.common.CommonPongC2SPacket;
+import net.minecraft.network.packet.c2s.play.*;
+import net.minecraft.util.Hand;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.util.PlayerInput;
+import net.minecraft.item.Items;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -175,13 +175,25 @@ public class Disabler extends Module {
         .visible(bookPayload::get)
         .build());
 
+    private final Setting<Integer> overflowCount = sgTiming.add(new IntSetting.Builder()
+        .name("overflow-count")
+        .description("Interact/release packet pairs sent per pulse in GRIM_OVERFLOW mode.")
+        .defaultValue(20)
+        .min(1).max(120)
+        .sliderRange(1, 120)
+        .visible(() -> mode.get() == DisablerMode.GRIM_OVERFLOW)
+        .build());
+
     public enum DisablerMode {
-        SPRINT_ONLY,  // Sprint toggle only — lowest packet count
-        TRANSACTION,  // Transaction + keepalive delay only — cleanest, no extra packets
-        STATE_RESET,  // State resets only (swing, abort, slot)
-        DESYNC,       // Transaction delay + sprint/sneak toggle
-        PAYLOAD,      // Book payload stall only
-        COMBINED      // All active methods
+        SPRINT_ONLY,   // Sprint toggle only — lowest packet count
+        TRANSACTION,   // Transaction + keepalive delay only — cleanest, no extra packets
+        STATE_RESET,   // State resets only (swing, abort, slot)
+        DESYNC,        // Transaction delay + sprint/sneak toggle
+        PAYLOAD,       // Book payload stall only
+        COMBINED,      // All active methods
+        GRIM_TRIDENT,  // Interact-item + release-use desync (Shoreline GRIM_TRIDENT)
+        GRIM_FIREWORK, // Interact-item + START_FALL_FLYING + release (Shoreline GRIM_FIREWORK)
+        GRIM_OVERFLOW  // Flood interact/release pairs to overflow Grim's packet processing
     }
 
     // ═══════════════════════════════════════════
@@ -200,7 +212,7 @@ public class Disabler extends Module {
     // ═══════════════════════════════════════════
 
     public Disabler() {
-        super(com.example.addon.AddonTemplate.CATEGORY, "disabler",
+        super(com.example.addon.DWAddons.CATEGORY, "disabler",
               "Disrupts Grim AntiCheat state tracking on 2b2t.");
     }
 
@@ -243,12 +255,12 @@ public class Disabler extends Module {
     private void onPacketReceive(PacketEvent.Receive event) {
         if (mc.player == null) return;
 
-        if (transactionDelay.get() && event.packet instanceof ClientboundPingPacket ping) {
+        if (transactionDelay.get() && event.packet instanceof CommonPingS2CPacket ping) {
             event.cancel();
-            pendingPings.add(new long[]{ping.getId(), tick + pingDelayTicks.get()});
+            pendingPings.add(new long[]{ping.getParameter(), tick + pingDelayTicks.get()});
         }
 
-        if (keepalivePause.get() && event.packet instanceof ClientboundKeepAlivePacket keepalive) {
+        if (keepalivePause.get() && event.packet instanceof KeepAliveS2CPacket keepalive) {
             event.cancel();
             pendingKeepAlives.add(new long[]{keepalive.getId(), tick + keepaliveDelayTicks.get()});
         }
@@ -260,7 +272,7 @@ public class Disabler extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.level == null) return;
+        if (mc.player == null || mc.world == null) return;
         tick++;
 
         // Flush delayed responses — always runs regardless of mode or speed gate
@@ -268,14 +280,14 @@ public class Disabler extends Module {
         flushPendingKeepAlives(tick);
 
         // Elytra assertion — every tick, only if elytra actually equipped
-        if (elytraToggle.get() && mc.player.getItemBySlot(EquipmentSlot.CHEST).getItem() == Items.ELYTRA) {
-            mc.player.connection.send(new ServerboundPlayerCommandPacket(
-                mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+        if (elytraToggle.get() && mc.player.getEquippedStack(EquipmentSlot.CHEST).getItem() == Items.ELYTRA) {
+            mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(
+                mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
         }
 
         // Speed gate for pulse methods
         if (onlyWhileMoving.get()) {
-            double speed = mc.player.getDeltaMovement().horizontalDistance() * 20.0;
+            double speed = mc.player.getVelocity().horizontalLength() * 20.0;
             if (speed < minSpeed.get()) return;
         }
 
@@ -298,6 +310,9 @@ public class Disabler extends Module {
                 doStateReset();
                 if (bookPayload.get())  doBookPayload();
             }
+            case GRIM_TRIDENT  -> doGrimTrident();
+            case GRIM_FIREWORK -> doGrimFirework();
+            case GRIM_OVERFLOW -> doGrimOverflow();
         }
 
         if (groundSpoof.get()) doGroundSpoof();
@@ -310,14 +325,14 @@ public class Disabler extends Module {
     private void flushPendingPings(long currentTick) {
         if (mc.player == null) return;
         while (!pendingPings.isEmpty() && pendingPings.peek()[1] <= currentTick) {
-            mc.player.connection.send(new ServerboundPongPacket((int) pendingPings.poll()[0]));
+            mc.player.networkHandler.sendPacket(new CommonPongC2SPacket((int) pendingPings.poll()[0]));
         }
     }
 
     private void flushPendingKeepAlives(long currentTick) {
         if (mc.player == null) return;
         while (!pendingKeepAlives.isEmpty() && pendingKeepAlives.peek()[1] <= currentTick) {
-            mc.player.connection.send(new ServerboundKeepAlivePacket(pendingKeepAlives.poll()[0]));
+            mc.player.networkHandler.sendPacket(new KeepAliveC2SPacket(pendingKeepAlives.poll()[0]));
         }
     }
 
@@ -334,14 +349,14 @@ public class Disabler extends Module {
     private void doSprintToggle() {
         if (mc.player == null) return;
         for (int i = 0; i < sprintToggleCount.get(); i++) {
-            mc.player.connection.send(new ServerboundPlayerCommandPacket(
-                mc.player, ServerboundPlayerCommandPacket.Action.START_SPRINTING));
-            mc.player.connection.send(new ServerboundPlayerCommandPacket(
-                mc.player, ServerboundPlayerCommandPacket.Action.STOP_SPRINTING));
+            mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(
+                mc.player, ClientCommandC2SPacket.Mode.START_SPRINTING));
+            mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(
+                mc.player, ClientCommandC2SPacket.Mode.STOP_SPRINTING));
         }
         // Always leave sprinting on so normal movement isn't affected
-        mc.player.connection.send(new ServerboundPlayerCommandPacket(
-            mc.player, ServerboundPlayerCommandPacket.Action.START_SPRINTING));
+        mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(
+            mc.player, ClientCommandC2SPacket.Mode.START_SPRINTING));
     }
 
     // ═══════════════════════════════════════════
@@ -359,14 +374,14 @@ public class Disabler extends Module {
         if (mc.player == null) return;
         boolean sprinting = mc.player.isSprinting();
         for (int i = 0; i < sneakToggleCount.get(); i++) {
-            mc.player.connection.send(new ServerboundPlayerInputPacket(
-                new Input(false, false, false, false, false, true, sprinting)));
-            mc.player.connection.send(new ServerboundPlayerInputPacket(
-                new Input(false, false, false, false, false, false, sprinting)));
+            mc.player.networkHandler.sendPacket(new PlayerInputC2SPacket(
+                new PlayerInput(false, false, false, false, false, true, sprinting)));
+            mc.player.networkHandler.sendPacket(new PlayerInputC2SPacket(
+                new PlayerInput(false, false, false, false, false, false, sprinting)));
         }
         // Always end uncrouched so movement feels normal
-        mc.player.connection.send(new ServerboundPlayerInputPacket(
-            new Input(false, false, false, false, false, false, sprinting)));
+        mc.player.networkHandler.sendPacket(new PlayerInputC2SPacket(
+            new PlayerInput(false, false, false, false, false, false, sprinting)));
     }
 
     // ═══════════════════════════════════════════
@@ -381,8 +396,8 @@ public class Disabler extends Module {
 
     private void doGroundSpoof() {
         if (mc.player == null) return;
-        mc.player.connection.send(new ServerboundMovePlayerPacket.StatusOnly(
-            !mc.player.onGround(), mc.player.horizontalCollision));
+        mc.player.networkHandler.sendPacket(new PlayerMoveC2SPacket.OnGroundOnly(
+            !mc.player.isOnGround(), mc.player.horizontalCollision));
     }
 
     // ═══════════════════════════════════════════
@@ -396,24 +411,24 @@ public class Disabler extends Module {
     private void doStateReset() {
         if (mc.player == null) return;
 
-        Vec3 pos = mc.player.position();
-        BlockPos belowPos = BlockPos.containing(pos).below();
+        Vec3d pos = mc.player.getPos();
+        BlockPos belowPos = BlockPos.ofFloored(pos).down();
 
         if (swingDesync.get()) {
-            mc.player.connection.send(new ServerboundSwingPacket(InteractionHand.MAIN_HAND));
+            mc.player.networkHandler.sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
         }
 
         if (actionDesync.get()) {
-            mc.player.connection.send(new ServerboundPlayerActionPacket(
-                ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK,
+            mc.player.networkHandler.sendPacket(new PlayerActionC2SPacket(
+                PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK,
                 belowPos, Direction.UP, 0));
         }
 
         if (slotDesync.get()) {
             int realSlot = mc.player.getInventory().getSelectedSlot();
             int fakeSlot = (realSlot + 1) % 9;
-            mc.player.connection.send(new ServerboundSetCarriedItemPacket(fakeSlot));
-            mc.player.connection.send(new ServerboundSetCarriedItemPacket(realSlot));
+            mc.player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(fakeSlot));
+            mc.player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(realSlot));
         }
     }
 
@@ -436,6 +451,62 @@ public class Disabler extends Module {
         for (int i = 0; i < bookPages.get(); i++) {
             pages.add(fullPage);
         }
-        mc.player.connection.send(new ServerboundEditBookPacket(slot, pages, Optional.empty()));
+        mc.player.networkHandler.sendPacket(new BookUpdateC2SPacket(slot, pages, Optional.empty()));
+    }
+
+    // ═══════════════════════════════════════════
+    //  GRIM EXPLOIT METHODS (Shoreline DisablerModule)
+    //
+    //  These port Shoreline's GRIM_TRIDENT / GRIM_FIREWORK / GRIM_OVERFLOW strategies into Mojang
+    //  mappings. They build on ServerboundUseItemPacket (interact-item) + a RELEASE_USE_ITEM player
+    //  action, plus START_FALL_FLYING for the firework variant. The server treats UseItem as the
+    //  start of an item use and RELEASE_USE_ITEM as its end; firing them back-to-back (and flooding
+    //  them, for overflow) desyncs Grim's item-use / elytra-boost state.
+    //
+    //  ⚠ Exploit-specific and version/anticheat-dependent. These mirror Shoreline's handling and may
+    //  already be patched by the current Grim build — implemented faithfully, NOT guaranteed to work.
+    // ═══════════════════════════════════════════
+
+    private void doGrimTrident() {
+        if (mc.player == null) return;
+        // Begin then immediately end a main-hand item use to whiplash Grim's use-item tracker.
+        sendUseItem(Hand.MAIN_HAND);
+        sendReleaseUse();
+    }
+
+    private void doGrimFirework() {
+        if (mc.player == null) return;
+        // Interact-item (rocket), assert elytra flight, then release — desyncs Grim's boost handling.
+        sendUseItem(Hand.MAIN_HAND);
+        mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(
+            mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
+        sendReleaseUse();
+        mc.player.networkHandler.sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
+    }
+
+    private void doGrimOverflow() {
+        if (mc.player == null) return;
+        // Flood interact/release pairs so Grim's single-threaded packet processing falls behind.
+        int n = overflowCount.get();
+        for (int i = 0; i < n; i++) {
+            sendUseItem(Hand.MAIN_HAND);
+            sendReleaseUse();
+        }
+    }
+
+    // Sequence 0 is intentional: the server uses it only to ack predicted block changes, which we
+    // don't care about here — the desync comes from the use/release pairing, not the sequence.
+    private void sendUseItem(Hand hand) {
+        if (mc.player == null) return;
+        mc.player.networkHandler.sendPacket(new PlayerInteractItemC2SPacket(
+            hand, 0, mc.player.getYaw(), mc.player.getPitch()));
+    }
+
+    private void sendReleaseUse() {
+        if (mc.player == null) return;
+        // Vanilla releases item use with pos ZERO / facing DOWN; the server ignores the coordinates
+        // for RELEASE_USE_ITEM and only acts on the action itself.
+        mc.player.networkHandler.sendPacket(new PlayerActionC2SPacket(
+            PlayerActionC2SPacket.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, Direction.DOWN));
     }
 }

@@ -20,19 +20,19 @@ repositories {
 }
 
 loom {
-    accessWidenerPath = file("src/main/resources/addon-template.accesswidener")
+    accessWidenerPath = file("src/main/resources/dw-addons.accesswidener")
 }
 
 dependencies {
     minecraft(libs.minecraft)
-    mappings(loom.officialMojangMappings())
+    mappings("${libs.yarn.mappings.get()}:v2")
     modImplementation(libs.fabric.loader)
     modImplementation(libs.meteor.client)
 
     // Baritone API (used by ElytraFlyPlusPlus' obstacle passer). Baritone is a separately
     // installed mod, so we compile against its API only and never bundle it. The jar ships
     // intermediary-mapped, so it must go through a `mod*` configuration for Loom to remap it
-    // to the project's Mojang mappings — a plain `compileOnly(files(...))` would NOT remap.
+    // to the project's Yarn mappings — a plain `compileOnly(files(...))` would NOT remap.
     modCompileOnly(files("libs/baritone-api-fabric-1.15.0.jar"))
 }
 

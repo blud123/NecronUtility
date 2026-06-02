@@ -1,6 +1,6 @@
 package com.example.addon.hud;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import com.example.addon.modules.VerticalVelocityTracker;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.hud.HudElement;
@@ -15,7 +15,7 @@ import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 public class VerticalVelocityHud extends HudElement {
 
     public static final HudElementInfo<VerticalVelocityHud> INFO = new HudElementInfo<>(
-        AddonTemplate.HUD_GROUP, "vertical-velocity",
+        DWAddons.HUD_GROUP, "vertical-velocity",
         "Shows vertical velocity and acceleration from the Vertical Tracker module.",
         VerticalVelocityHud::new);
 

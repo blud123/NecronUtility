@@ -2,7 +2,7 @@ package com.example.addon.mixin;
 
 import com.example.addon.modules.FastBreak;
 import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
-import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.entity.player.PlayerInventory;
 import org.objectweb.asm.Opcodes;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -26,7 +26,7 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * <p>{@code method = "*"} targets every method in {@code Inventory}; {@code require = 0} keeps
  * the mixin from failing to apply on the methods that don't read the field.
  */
-@Mixin(Inventory.class)
+@Mixin(PlayerInventory.class)
 public class SilentSwapMixin {
 
     @ModifyExpressionValue(
@@ -34,14 +34,14 @@ public class SilentSwapMixin {
         require = 0,
         at = @At(
             value = "FIELD",
-            target = "Lnet/minecraft/world/entity/player/Inventory;selected:I",
+            target = "Lnet/minecraft/entity/player/PlayerInventory;selectedSlot:I",
             opcode = Opcodes.GETFIELD
         )
     )
     private int meteorAddon$redirectSelectedSlot(int original) {
         if (mc.player == null) return original;
         // Only override the local player's inventory, never other inventories.
-        if (((Inventory) (Object) this).player != mc.player) return original;
+        if (((PlayerInventory) (Object) this).player != mc.player) return original;
         int silent = FastBreak.getSilentSlot();
         return silent == -1 ? original : silent;
     }

@@ -1,12 +1,12 @@
 package com.example.addon.modules.movement;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.util.math.Vec3d;
 
 /**
  * Keybind-triggered speed burst in the look direction, spread over several ticks so each tick's
@@ -43,16 +43,16 @@ public class VelocityBoost extends Module {
         .name("strength")
         .description("Boost magnitude in the look direction.")
         .defaultValue(1.5)
-        .min(0.1).max(150.0)
-        .sliderRange(0.1, 150.0)
+        .min(0).max(150.0)
+        .sliderRange(0, 150.0)
         .build());
 
     private final Setting<Double> vertical = sgGeneral.add(new DoubleSetting.Builder()
         .name("vertical")
         .description("Extra upward velocity.")
         .defaultValue(0.2)
-        .min(-1.0).max(100.0)
-        .sliderRange(-1.0, 100.0)
+        .min(-100.0).max(100.0)
+        .sliderRange(-100.0, 100.0)
         .build());
 
     private final Setting<Integer> ticks = sgGeneral.add(new IntSetting.Builder()
@@ -73,7 +73,7 @@ public class VelocityBoost extends Module {
     private int holdTimer = 0;
 
     public VelocityBoost() {
-        super(AddonTemplate.CATEGORY, "velocity-boost",
+        super(DWAddons.CATEGORY, "velocity-boost",
             "Keybind speed burst in the look direction, spread over ticks to stay within tolerance.");
     }
 
@@ -85,7 +85,7 @@ public class VelocityBoost extends Module {
 
     private void trigger() {
         if (!isActive() || mc.player == null) return;
-        if (requireElytra.get() && !mc.player.isFallFlying()) return;
+        if (requireElytra.get() && !mc.player.isGliding()) return;
 
         remaining = ticks.get();
         holdTimer = repeatDelay.get(); // Resets the delay timer so it doesn't double-fire instantly when initially pressed
@@ -109,15 +109,15 @@ public class VelocityBoost extends Module {
 
         if (remaining <= 0) return;
 
-        if (requireElytra.get() && !mc.player.isFallFlying()) {
+        if (requireElytra.get() && !mc.player.isGliding()) {
             remaining = 0;
             return;
         }
 
         int n = Math.max(1, ticks.get());
-        Vec3 look = mc.player.getLookAngle();
-        Vec3 v = mc.player.getDeltaMovement();
-        mc.player.setDeltaMovement(
+        Vec3d look = mc.player.getRotationVector();
+        Vec3d v = mc.player.getVelocity();
+        mc.player.setVelocity(
             v.x + look.x * strength.get() / n,
             v.y + vertical.get() / n,
             v.z + look.z * strength.get() / n);

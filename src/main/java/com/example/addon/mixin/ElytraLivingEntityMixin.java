@@ -2,8 +2,8 @@ package com.example.addon.mixin;
 
 import com.example.addon.modules.ElytraBouncePlus;
 import meteordevelopment.meteorclient.systems.modules.Modules;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -16,9 +16,8 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 @Mixin(LivingEntity.class)
 public abstract class ElytraLivingEntityMixin {
 
-    // Mojang: noJumpDelay — Yarn: jumpingCooldown
-    // If this field name causes a compile error, check the Mojang-mapped LivingEntity source.
-    @Shadow private int noJumpDelay;
+    // Yarn: jumpingCooldown (Mojang: noJumpDelay)
+    @Shadow private int jumpingCooldown;
 
     private ElytraBouncePlus efly;
 
@@ -30,21 +29,21 @@ public abstract class ElytraLivingEntityMixin {
     }
 
     private boolean isLocalPlayer() {
-        return mc.player != null && mc.player.getUUID().equals(((Entity) (Object) this).getUUID());
+        return mc.player != null && mc.player.getUuid().equals(((Entity) (Object) this).getUuid());
     }
 
-    // Mojang: aiStep — Yarn: tickMovement
-    @Inject(method = "aiStep", at = @At("HEAD"))
+    // Yarn: tickMovement (Mojang: aiStep)
+    @Inject(method = "tickMovement", at = @At("HEAD"))
     private void onAiStep(CallbackInfo ci) {
         if (isLocalPlayer() && efly != null && efly.enabled()) {
-            this.noJumpDelay = 0;
+            this.jumpingCooldown = 0;
         }
     }
 
-    // Mojang: isFallFlying — Yarn: isGliding
+    // Yarn: isGliding (Mojang: isFallFlying)
     // Critical: forces client physics into elytra aerodynamics every tick, preventing
     // ground friction from bleeding horizontal speed between bounces.
-    @Inject(method = "isFallFlying", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "isGliding", at = @At("HEAD"), cancellable = true)
     private void onIsFallFlying(CallbackInfoReturnable<Boolean> cir) {
         if (isLocalPlayer() && efly != null && efly.enabled()) {
             cir.setReturnValue(true);

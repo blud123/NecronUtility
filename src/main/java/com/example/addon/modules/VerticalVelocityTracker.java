@@ -1,6 +1,6 @@
 package com.example.addon.modules;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
@@ -57,7 +57,7 @@ public class VerticalVelocityTracker extends Module {
     private boolean hasPrev = false;
 
     public VerticalVelocityTracker() {
-        super(AddonTemplate.CATEGORY, "vertical-tracker",
+        super(DWAddons.CATEGORY, "vertical-tracker",
             "Passively tracks and displays vertical velocity and acceleration. Never alters movement.");
     }
 
@@ -104,8 +104,8 @@ public class VerticalVelocityTracker extends Module {
         tracking = true;
 
         if (actionbar.get()) {
-            mc.player.displayClientMessage(
-                net.minecraft.network.chat.Component.literal(infoText(showAccel.get())), true);
+            mc.player.sendMessage(
+                net.minecraft.text.Text.literal(infoText(showAccel.get())), true);
         }
     }
 

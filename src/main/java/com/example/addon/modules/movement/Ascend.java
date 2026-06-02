@@ -1,6 +1,6 @@
 package com.example.addon.modules.movement;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
@@ -146,7 +146,7 @@ public class Ascend extends Module {
     private double lastBurrowY;    // COLLISION/BURROW: detect server teleport steps
 
     public Ascend() {
-        super(AddonTemplate.CATEGORY, "ascend",
+        super(DWAddons.CATEGORY, "ascend",
             "Selectable vertical-ascent method. Research rig - pair with MovementProbe.");
     }
 

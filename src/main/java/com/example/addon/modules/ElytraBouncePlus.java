@@ -1,6 +1,6 @@
 package com.example.addon.modules;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import com.example.addon.mixin.EntityAccessor;
 import com.example.addon.mixin.IServerboundMovePlayerPacket;
 import com.example.addon.mixin.LivingEntityInvoker;
@@ -9,18 +9,18 @@ import com.example.addon.utils.PacketLimiter;
 import meteordevelopment.meteorclient.events.entity.player.PlayerMoveEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.utils.Utils;
-import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.item.Items;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.Items;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.systems.modules.world.Timer;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
-import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
-import net.minecraft.world.entity.MoverType;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
+import net.minecraft.entity.MovementType;
+import net.minecraft.util.math.Vec3d;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -161,28 +161,28 @@ public class ElytraBouncePlus extends Module {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    private Vec3    lastPos            = null;
-    private Vec3    bounceLastPos      = null;
+    private Vec3d    lastPos            = null;
+    private Vec3d    bounceLastPos      = null;
     private boolean packetBounceActive = false;
     private boolean wasOnGround        = false;
     private int     fallFlyCooldown    = 0;
 
     public ElytraBouncePlus() {
-        super(AddonTemplate.CATEGORY, "elytra-bounce-plus", "Elytra highway speed for diagonal and cardinal 2b2t tunnels. Uses single-packet desync (no flooding).");
+        super(DWAddons.CATEGORY, "elytra-bounce-plus", "Elytra highway speed for diagonal and cardinal 2b2t tunnels. Uses single-packet desync (no flooding).");
     }
 
     /** Called by both mixins to gate all injections. Requires elytra to be worn. */
     public boolean enabled() {
         return isActive()
             && mc.player != null
-            && mc.player.getItemBySlot(EquipmentSlot.CHEST).getItem() == Items.ELYTRA;
+            && mc.player.getEquippedStack(EquipmentSlot.CHEST).getItem() == Items.ELYTRA;
     }
 
     @Override
     public void onActivate() {
         if (mc.player == null) return;
-        lastPos            = mc.player.position();
-        bounceLastPos      = mc.player.position();
+        lastPos            = mc.player.getPos();
+        bounceLastPos      = mc.player.getPos();
         packetBounceActive = false;
         fallFlyCooldown    = 0;
         wasOnGround        = ((EntityAccessor) mc.player).isOnGroundAccessor();
@@ -203,18 +203,18 @@ public class ElytraBouncePlus extends Module {
         if (lockPitch.get()) ((EntityAccessor) mc.player).invokeSetXRot(pitch.get().floatValue());
 
         if (onGround) {
-            Vec3 ps = Utils.getPlayerSpeed();
+            Vec3d ps = Utils.getPlayerSpeed();
             boolean shouldJump = !motionYBoost.get()
-                || new Vec3(ps.x, 0.0, ps.z).length() < speed.get();
+                || new Vec3d(ps.x, 0.0, ps.z).length() < speed.get();
             if (shouldJump) ((LivingEntityInvoker) mc.player).invokeJump();
         }
 
         // Edge-trigger elytra deploy: only re-send START_FALL_FLYING when not already gliding,
         // and rate-limit it. Spamming the toggle every tick is abnormal and pointless (B.2.1).
         if (fallFlyCooldown > 0) fallFlyCooldown--;
-        if (enabled() && !mc.player.isFallFlying() && fallFlyCooldown <= 0) {
-            if (PacketLimiter.send(new ServerboundPlayerCommandPacket(
-                    mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING))) {
+        if (enabled() && !mc.player.isGliding() && fallFlyCooldown <= 0) {
+            if (PacketLimiter.send(new ClientCommandC2SPacket(
+                    mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING))) {
                 fallFlyCooldown = FALL_FLY_COOLDOWN;
             }
         }
@@ -226,7 +226,7 @@ public class ElytraBouncePlus extends Module {
         }
 
         wasOnGround   = onGround;
-        bounceLastPos = mc.player.position();
+        bounceLastPos = mc.player.getPos();
     }
 
     // ─── Motion-Y boost ───────────────────────────────────────────────────────
@@ -234,7 +234,7 @@ public class ElytraBouncePlus extends Module {
     @EventHandler
     private void onPlayerMove(PlayerMoveEvent event) {
         if (mc.player == null) return;
-        if (event.type != MoverType.SELF) return;
+        if (event.type != MovementType.SELF) return;
         if (!enabled()) return;
         if (!motionYBoost.get()) return;
 
@@ -242,29 +242,29 @@ public class ElytraBouncePlus extends Module {
         if (needsCollision && !mc.player.horizontalCollision) return;
 
         if (lastPos == null) {
-            lastPos = mc.player.position();
+            lastPos = mc.player.getPos();
             return;
         }
 
-        Vec3 diff = mc.player.position().subtract(lastPos);
-        double speedBps = new Vec3(diff.x * 20, 0, diff.z * 20).length();
+        Vec3d diff = mc.player.getPos().subtract(lastPos);
+        double speedBps = new Vec3d(diff.x * 20, 0, diff.z * 20).length();
 
         Timer timer = Modules.get().get(Timer.class);
         if (timer != null && timer.isActive()) speedBps *= timer.getMultiplier();
 
         if (((EntityAccessor) mc.player).isOnGroundAccessor() && mc.player.isSprinting() && speedBps < speed.get()) {
             if (speedBps > 20 || tunnelBounce.get()) {
-                Vec3 vel = mc.player.getDeltaMovement();
+                Vec3d vel = mc.player.getVelocity();
                 // Hysteresis: only zero Y when there's actual vertical motion to cancel.
                 // Zeroing an already-flat Y every tick is a no-op that causes stutter (B.2.3).
                 if (Math.abs(vel.y) > 0.1) {
-                    event.movement = new Vec3(event.movement.x, 0.0, event.movement.z);
-                    mc.player.setDeltaMovement(vel.x, 0.0, vel.z);
+                    event.movement = new Vec3d(event.movement.x, 0.0, event.movement.z);
+                    mc.player.setVelocity(vel.x, 0.0, vel.z);
                 }
             }
         }
 
-        lastPos = mc.player.position();
+        lastPos = mc.player.getPos();
     }
 
     // ─── Packet Desync — modify the single move packet the client already sends ──
@@ -275,12 +275,12 @@ public class ElytraBouncePlus extends Module {
     private void onSendPacket(PacketEvent.Send event) {
         if (mc.player == null) return;
         if (!packetBounce.get() || !packetBounceActive) return;
-        if (!(event.packet instanceof ServerboundMovePlayerPacket)) return;
+        if (!(event.packet instanceof PlayerMoveC2SPacket)) return;
 
         IServerboundMovePlayerPacket iPacket = (IServerboundMovePlayerPacket) event.packet;
 
-        Vec3 pos = mc.player.position();
-        Vec3 vel = mc.player.getDeltaMovement();
+        Vec3d pos = mc.player.getPos();
+        Vec3d vel = mc.player.getVelocity();
         HighwayUtil.Axis axis = HighwayUtil.detect(pos, vel, HIGHWAY_TOLERANCE);
         double strength  = desyncStrength.get();
 
@@ -305,12 +305,12 @@ public class ElytraBouncePlus extends Module {
 
     private void handlePacketBounce() {
         if (mc.player == null) return;
-        Vec3 currentPos = mc.player.position();
-        Vec3 velocity   = mc.player.getDeltaMovement();
+        Vec3d currentPos = mc.player.getPos();
+        Vec3d velocity   = mc.player.getVelocity();
 
-        double spd = velocity.horizontalDistance() * 20.0;
+        double spd = velocity.horizontalLength() * 20.0;
 
-        Vec3   prev      = bounceLastPos != null ? bounceLastPos : currentPos;
+        Vec3d   prev      = bounceLastPos != null ? bounceLastPos : currentPos;
         double movedX    = Math.abs(currentPos.x - prev.x);
         double movedZ    = Math.abs(currentPos.z - prev.z);
         double expectedX = Math.abs(velocity.x);
@@ -383,8 +383,8 @@ public class ElytraBouncePlus extends Module {
             }
         }
 
-        double newVy = mc.player.onGround() ? 0.0 : velocity.y;
-        mc.player.setDeltaMovement(newVx, newVy, newVz);
+        double newVy = mc.player.isOnGround() ? 0.0 : velocity.y;
+        mc.player.setVelocity(newVx, newVy, newVz);
         // No flooding and no burst packets — the velocity set above plus the single-packet
         // edit in onSendPacket is the entire effect. Sprint is set on landing in onTick.
     }

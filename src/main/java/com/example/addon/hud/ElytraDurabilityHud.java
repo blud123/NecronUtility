@@ -1,14 +1,14 @@
 package com.example.addon.hud;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.hud.HudElement;
 import meteordevelopment.meteorclient.systems.hud.HudElementInfo;
 import meteordevelopment.meteorclient.systems.hud.HudRenderer;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
-import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -16,7 +16,7 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 public class ElytraDurabilityHud extends HudElement {
 
     public static final HudElementInfo<ElytraDurabilityHud> INFO = new HudElementInfo<>(
-        AddonTemplate.HUD_GROUP, "elytra-durability",
+        DWAddons.HUD_GROUP, "elytra-durability",
         "Shows remaining elytra durability, coloured by threshold.", ElytraDurabilityHud::new);
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -63,10 +63,10 @@ public class ElytraDurabilityHud extends HudElement {
         SettingColor color;
 
         ItemStack chest = mc.player != null
-            ? mc.player.getItemBySlot(EquipmentSlot.CHEST) : ItemStack.EMPTY;
+            ? mc.player.getEquippedStack(EquipmentSlot.CHEST) : ItemStack.EMPTY;
 
         if (mc.player != null && chest.getItem() == Items.ELYTRA) {
-            int remaining = chest.getMaxDamage() - chest.getDamageValue();
+            int remaining = chest.getMaxDamage() - chest.getDamage();
             text = prefix.get() + remaining;
             color = remaining <= lowThreshold.get() ? lowColor.get() : okColor.get();
         } else {

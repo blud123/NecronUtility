@@ -7,17 +7,19 @@ import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
-import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
+import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
+import net.minecraft.util.Hand;
+import net.minecraft.block.BlockState;
 
-import net.minecraft.client.Minecraft;
+import net.minecraft.client.MinecraftClient;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -53,8 +55,16 @@ public class FastBreak extends Module {
     // SetCarriedItem packet when it actually changes.
     private int lastServerSlot = -1;
 
+    // Real (visually-held) selected slot last tick, for switch-reset detection. Distinct from
+    // lastServerSlot, which tracks the silently-synced tool slot.
+    private int lastRealSlot = -1;
+
+    // Wall-clock time of the last finishing STOP_DESTROY_BLOCK, for the Grim inter-break delay.
+    private long lastFinishMs = 0L;
+
     // ── Settings ─────────────────────────────────────────────────────────
     private final SettingGroup sg       = settings.getDefaultGroup();
+    private final SettingGroup sgGrim   = settings.createGroup("Grim");
     private final SettingGroup sgRender = settings.createGroup("Render");
 
     private final Setting<Integer> maxBlocks = sg.add(new IntSetting.Builder()
@@ -69,6 +79,49 @@ public class FastBreak extends Module {
         .name("swap-tool")
         .description("Silently swap to the best tool in your hotbar for each block.")
         .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> rotate = sg.add(new BoolSetting.Builder()
+        .name("rotate")
+        .description("Rotate to the block face before sending the finishing packet. Mostly helps under Grim.")
+        .defaultValue(false)
+        .build());
+
+    private final Setting<Boolean> multitask = sg.add(new BoolSetting.Builder()
+        .name("multitask")
+        .description("Keep breaking while using an item (eating, blocking, drawing a bow). Off = pause breaks while using.")
+        .defaultValue(false)
+        .build());
+
+    private final Setting<Boolean> switchReset = sg.add(new BoolSetting.Builder()
+        .name("switch-reset")
+        .description("Restart in-progress break progress if you change your real selected hotbar slot mid-break.")
+        .defaultValue(false)
+        .build());
+
+    // ── Grim group ───────────────────────────────────────────────────────
+    // Anticheat behaviour drifts over time: these mirror Shoreline's 2.x Grim FastBreak handling
+    // and may need revalidation against the current Grim build. Not guaranteed to bypass anything.
+    private final Setting<Boolean> grim = sgGrim.add(new BoolSetting.Builder()
+        .name("grim")
+        .description("Use Grim-safe block-break packet timing (delayed finishes + a START/ABORT/STOP/swing sequence).")
+        .defaultValue(false)
+        .build());
+
+    private final Setting<Boolean> grimV3 = sgGrim.add(new BoolSetting.Builder()
+        .name("grim-v3")
+        .description("Use the newer Grim packet sequence on each block start.")
+        .defaultValue(false)
+        .visible(grim::get)
+        .build());
+
+    private final Setting<Integer> breakDelayMs = sgGrim.add(new IntSetting.Builder()
+        .name("break-delay-ms")
+        .description("Minimum milliseconds between consecutive break finishes while Grim mode is on.")
+        .defaultValue(300)
+        .min(0).max(500)
+        .sliderRange(0, 500)
+        .visible(grim::get)
         .build());
 
     private final Setting<Boolean> renderBreak = sgRender.add(new BoolSetting.Builder()
@@ -140,7 +193,7 @@ public class FastBreak extends Module {
 
     public FastBreak() {
         super(
-            com.example.addon.AddonTemplate.CATEGORY,
+            com.example.addon.DWAddons.CATEGORY,
             "fast-break",
             "Break blocks faster using packet-level control with automatic tool selection. Works with Nuker."
         );
@@ -154,6 +207,8 @@ public class FastBreak extends Module {
         secondary = null;
         silentSlot = -1;
         lastServerSlot = mc.player != null ? mc.player.getInventory().getSelectedSlot() : -1;
+        lastRealSlot   = lastServerSlot;
+        lastFinishMs   = 0L;
     }
 
     @Override
@@ -172,17 +227,76 @@ public class FastBreak extends Module {
 
     @EventHandler
     private void onStartBreaking(StartBreakingBlockEvent event) {
-        if (mc.player == null || mc.level == null) return;
+        if (mc.player == null || mc.world == null) return;
+        beginBreak(event.blockPos, event.direction);
+        // Always swallow the vanilla break — we take it over whether or not a new target started.
+        event.setCancelled(true);
+    }
 
-        BlockPos pos   = event.blockPos;
-        Direction face = event.direction;
+    /**
+     * Public entry point so other modules (e.g. {@link Nuker}) can drive a block through the same
+     * break pipeline instead of duplicating the packet/slot logic. Feeding the same position each
+     * tick is a no-op once it is already being tracked, exactly like a held left-click.
+     */
+    public void requestBreak(BlockPos pos, Direction face) {
+        if (!isActive() || mc.player == null || mc.world == null) return;
+        beginBreak(pos, face);
+    }
 
-        BlockState state = mc.level.getBlockState(pos);
+    /**
+     * Instant one-shot break (START + finishing STOP) routed through FastBreak's tool sync — the
+     * "packet-mine" fast path for blocks weak enough to break in a single hit. Does not occupy a
+     * primary/secondary slot. Used by {@link Nuker} so it never sends its own break packets.
+     */
+    public void packetBreak(BlockPos pos, Direction face) {
+        if (!isActive() || mc.player == null || mc.world == null) return;
+        BlockState state = mc.world.getBlockState(pos);
+        if (state.isAir()) return;
+        syncToolFor(state, pos);
+        MineTarget t = new MineTarget(pos, face, false);
+        send(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, t);
+        sendFinish(t);
+    }
+
+    /**
+     * Pre-syncs the best tool for a block to the server without starting a break — lets a caller
+     * implement "swap before start" by syncing the tool a step ahead of the START packet. Reuses
+     * the same {@link #syncServerSlot} path, so there is still only one server-slot owner.
+     */
+    public void syncToolFor(BlockState state, BlockPos pos) {
+        if (!isActive() || mc.player == null) return;
+        int bestSlot = swapTool.get() ? bestToolSlot(state, pos) : -1;
+        syncServerSlot(bestSlot != -1 ? bestSlot : mc.player.getInventory().getSelectedSlot());
+    }
+
+    /**
+     * The tool slot FastBreak would actually hold for this block ({@code -1} = keep current),
+     * honoring the swap-tool setting. Lets callers (e.g. {@link Nuker}) estimate break speed with
+     * the exact slot FastBreak will use, so their predictions can't disagree with the real break.
+     */
+    public int effectiveToolSlot(BlockState state, BlockPos pos) {
+        return swapTool.get() ? bestToolSlot(state, pos) : -1;
+    }
+
+    /** Aborts an in-progress break for {@code pos} if FastBreak is tracking it (used by Nuker on eviction). */
+    public void cancelBreak(BlockPos pos) {
+        if (mc.player == null) return;
+        if (primary != null && primary.pos.equals(pos)) {
+            sendAbort(primary);
+            primary = null;
+        } else if (secondary != null && secondary.pos.equals(pos)) {
+            sendAbort(secondary);
+            secondary = null;
+        }
+    }
+
+    /** Starts (or demotes/replaces) a packet break for {@code pos}. Shared by the click event and Nuker. */
+    private void beginBreak(BlockPos pos, Direction face) {
+        BlockState state = mc.world.getBlockState(pos);
         if (state.isAir()) return;
 
-        // Already tracking this block — just swallow the vanilla break.
+        // Already tracking this block — nothing to do.
         if ((primary != null && primary.pos.equals(pos)) || (secondary != null && secondary.pos.equals(pos))) {
-            event.setCancelled(true);
             return;
         }
 
@@ -206,16 +320,24 @@ public class FastBreak extends Module {
         primary = new MineTarget(pos, face, false);
         sendStart(primary);
         // Sync the tool to the server at the moment the break starts and hold it for the whole break.
-        int bestSlot = swapTool.get() ? findBestToolSlot(state) : -1;
+        int bestSlot = swapTool.get() ? bestToolSlot(state, pos) : -1;
         syncServerSlot(bestSlot != -1 ? bestSlot : mc.player.getInventory().getSelectedSlot());
-        event.setCancelled(true);
     }
 
     // ── Per-tick progress update ──────────────────────────────────────────
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.level == null) return;
+        if (mc.player == null || mc.world == null) return;
+
+        // Switch-reset: if the real held slot changed this tick (silentSlot is -1 here, so the getter
+        // returns the genuine selected slot), restart progress so timing reflects the new tool.
+        int realSlot = mc.player.getInventory().getSelectedSlot();
+        if (switchReset.get() && lastRealSlot != -1 && realSlot != lastRealSlot) {
+            resetProgress(primary);
+            resetProgress(secondary);
+        }
+        lastRealSlot = realSlot;
 
         // Process secondary first so the primary (the active destroy slot) wins the held server
         // slot for this tick — that's the break the server is actively timing.
@@ -226,17 +348,29 @@ public class FastBreak extends Module {
         if (primary == null && secondary == null) restoreSlot();
     }
 
+    /** Restarts a target's break progress (used by switch-reset). */
+    private void resetProgress(MineTarget t) {
+        if (t == null) return;
+        t.breakingTicks = 0;
+        t.startMs = System.currentTimeMillis();
+        t.estSlot = Integer.MIN_VALUE; // force estTicks recompute for the new tool
+    }
+
     /**
      * Advances one tick of breaking for a target. Returns {@code null} when the target finished
      * or became invalid, otherwise the (mutated) target.
      */
     private MineTarget tickTarget(MineTarget target) {
-        if (mc.player == null || mc.level == null) return null;
+        if (mc.player == null || mc.world == null) return null;
 
-        BlockState state = mc.level.getBlockState(target.pos);
+        BlockState state = mc.world.getBlockState(target.pos);
         if (state.isAir()) return null; // already gone
 
-        int bestSlot = swapTool.get() ? findBestToolSlot(state) : -1;
+        // Multitask gate: unless enabled, don't progress or finish a break while using an item
+        // (eating, blocking, drawing a bow). Hold the target so it resumes when the use ends.
+        if (!multitask.get() && mc.player.isUsingItem()) return target;
+
+        int bestSlot = swapTool.get() ? bestToolSlot(state, target.pos) : -1;
 
         // Compute the per-tick break fraction with the best tool silently active (client-side only).
         float breakDelta = getBreakDelta(state, target.pos, bestSlot);
@@ -253,7 +387,16 @@ public class FastBreak extends Module {
 
         target.breakingTicks++;
         if (target.breakingTicks >= target.estTicks) {
+            // Grim inter-break delay: hold the finishing STOP until break-delay-ms has elapsed since
+            // the last finish, so finishes aren't sent back-to-back. The block stays at full progress
+            // server-side until we send STOP, so the only effect is a slightly later break.
+            if (grim.get() && System.currentTimeMillis() - lastFinishMs < breakDelayMs.get()) {
+                return target;
+            }
+            // Rotate to the block face before the finishing packet so the server sees us looking at it.
+            if (rotate.get()) Rotations.rotate(Rotations.getYaw(target.pos), Rotations.getPitch(target.pos));
             sendFinish(target);
+            lastFinishMs = System.currentTimeMillis();
             // Do NOT remove the block client-side — let the server send the block update.
             // Optimistic removal before server confirmation is what causes ghost blocks.
             return null;
@@ -265,19 +408,19 @@ public class FastBreak extends Module {
     // ── Tool selection ────────────────────────────────────────────────────
 
     /**
-     * Hotbar slot (0-8) with the highest mining speed for this block, or -1 if nothing in the
-     * hotbar beats the bare hand. Reads {@code getItem(i)} directly, so it is unaffected by the
-     * silent override.
+     * Hotbar slot (0-8) that breaks this block fastest, or -1 if nothing beats the currently-held
+     * item. Ranks by {@link #breakDeltaForSlot} — the SAME quantity used to time the break — so it
+     * folds in Efficiency, Haste, Mining Fatigue, being submerged/off-ground, etc., and selection
+     * can never disagree with timing. Shared by FastBreak and {@link Nuker} (single source of truth).
      */
-    private int findBestToolSlot(BlockState state) {
-        if (mc.player == null) return -1;
+    static int bestToolSlot(BlockState state, BlockPos pos) {
+        // Baseline = the real held item (silent slot -1 resolves to the genuine selected slot).
+        float bestDelta = breakDeltaForSlot(state, pos, -1);
         int bestSlot = -1;
-        float bestSpeed = 1.0f;
         for (int i = 0; i < 9; i++) {
-            ItemStack stack = mc.player.getInventory().getItem(i);
-            float speed = stack.getDestroySpeed(state);
-            if (speed > bestSpeed) {
-                bestSpeed = speed;
+            float delta = breakDeltaForSlot(state, pos, i);
+            if (delta > bestDelta) {
+                bestDelta = delta;
                 bestSlot  = i;
             }
         }
@@ -293,11 +436,11 @@ public class FastBreak extends Module {
      * chosen tool without touching the real slot or notifying the server.
      */
     private float getBreakDelta(BlockState state, BlockPos pos, int toolSlot) {
-        if (mc.player == null || mc.level == null) return 0;
+        if (mc.player == null || mc.world == null) return 0;
         int saved = silentSlot;
         silentSlot = toolSlot;
         try {
-            return state.getDestroyProgress(mc.player, mc.level, pos);
+            return state.calcBlockBreakingDelta(mc.player, mc.world, pos);
         } finally {
             silentSlot = saved;
         }
@@ -309,12 +452,12 @@ public class FastBreak extends Module {
      * of the getDestroyProgress call and is always restored.
      */
     static float breakDeltaForSlot(BlockState state, BlockPos pos, int toolSlot) {
-        Minecraft client = Minecraft.getInstance();
-        if (client.player == null || client.level == null) return 0;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null || client.world == null) return 0;
         int saved = silentSlot;
         silentSlot = toolSlot;
         try {
-            return state.getDestroyProgress(client.player, client.level, pos);
+            return state.calcBlockBreakingDelta(client.player, client.world, pos);
         } finally {
             silentSlot = saved;
         }
@@ -330,31 +473,68 @@ public class FastBreak extends Module {
 
     private void syncServerSlot(int slot) {
         if (mc.player == null || slot == lastServerSlot) return;
-        mc.player.connection.send(new ServerboundSetCarriedItemPacket(slot));
+        mc.player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(slot));
         lastServerSlot = slot;
     }
 
     // ── Packet helpers ────────────────────────────────────────────────────
 
-    private void sendStart(MineTarget t)  { send(ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, t); }
-    private void sendAbort(MineTarget t)  { send(ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, t); }
+    private void sendStart(MineTarget t)  {
+        if (grim.get()) { sendStartGrim(t); return; }
+        send(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, t);
+    }
+    private void sendAbort(MineTarget t)  { send(PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, t); }
+
+    /**
+     * Grim-specific start sequence. Mirrors Shoreline's 2.x Grim FastBreak handling: it interleaves
+     * START/ABORT/STOP destroy actions with swings so Grim's block-action state machine sees a
+     * "clean" begin-and-cancel before the real break proceeds. The server treats START as begin,
+     * ABORT as cancel, and STOP as finish/hand-off of its single destroy slot — sending them in
+     * quick succession resets that slot rather than completing a break.
+     *
+     * <p>⚠ Anticheat behaviour changes over time; this may need revalidation against the current
+     * Grim build and is not guaranteed to bypass anything.
+     */
+    private void sendStartGrim(MineTarget t) {
+        if (grimV3.get()) {
+            // grimV3 path: STOP, START, ABORT to flush the slot, then STOP + three swings.
+            send(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, t);
+            send(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, t);
+            send(PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, t);
+            send(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, t);
+            swing(); swing(); swing();
+        } else {
+            // grimV3-off path: two rounds of START / ABORT / STOP / swing.
+            for (int rep = 0; rep < 2; rep++) {
+                send(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, t);
+                send(PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, t);
+                send(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, t);
+                swing();
+            }
+        }
+    }
+
+    private void swing() {
+        if (mc.player == null) return;
+        mc.player.networkHandler.sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
+    }
 
     // STOP_DESTROY_BLOCK both completes a break and hands one off to the server's delayed slot;
     // the server decides which based on its own tracked progress, so finish and hand-off are the
     // same packet (kept as two names for readability).
-    private void sendStop(MineTarget t)   { send(ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, t); }
-    private void sendFinish(MineTarget t) { send(ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, t); }
+    private void sendStop(MineTarget t)   { send(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, t); }
+    private void sendFinish(MineTarget t) { send(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, t); }
 
-    private void send(ServerboundPlayerActionPacket.Action action, MineTarget t) {
+    private void send(PlayerActionC2SPacket.Action action, MineTarget t) {
         if (mc.player == null) return;
-        mc.player.connection.send(new ServerboundPlayerActionPacket(action, t.pos, t.face));
+        mc.player.networkHandler.sendPacket(new PlayerActionC2SPacket(action, t.pos, t.face));
     }
 
     // ── Render ────────────────────────────────────────────────────────────
 
     @EventHandler
     private void onRender(Render3DEvent event) {
-        if (!renderBreak.get() || mc.player == null || mc.level == null) return;
+        if (!renderBreak.get() || mc.player == null || mc.world == null) return;
         if (Modules.get().get(Nuker.class).isActive()) return;
         renderTarget(event, primary);
         renderTarget(event, secondary);
@@ -363,7 +543,7 @@ public class FastBreak extends Module {
     private void renderTarget(Render3DEvent event, MineTarget target) {
         if (target == null) return;
 
-        BlockState state = mc.level.getBlockState(target.pos);
+        BlockState state = mc.world.getBlockState(target.pos);
         if (state.isAir()) return;
 
         // Time-based, tick-independent growth: the cube expands continuously from the block centre

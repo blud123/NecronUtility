@@ -1,6 +1,6 @@
 package com.example.addon.mixin;
 
-import net.minecraft.world.entity.Entity;
+import net.minecraft.entity.Entity;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
 import org.spongepowered.asm.mixin.gen.Invoker;
@@ -11,9 +11,9 @@ public interface EntityAccessor {
     @Accessor("onGround")
     boolean isOnGroundAccessor();
 
-    @Invoker("setYRot")
+    @Invoker("setYaw")
     void invokeSetYRot(float yaw);
 
-    @Invoker("setXRot")
+    @Invoker("setPitch")
     void invokeSetXRot(float pitch);
 }

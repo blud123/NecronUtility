@@ -1,17 +1,17 @@
 package com.example.addon.modules.render;
 
-import com.example.addon.AddonTemplate;
+import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.events.render.TooltipDataEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import meteordevelopment.meteorclient.utils.tooltip.ContainerTooltipComponent;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.core.component.DataComponents;
-import net.minecraft.world.item.BlockItem;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.component.ItemContainerContents;
-import net.minecraft.world.level.block.ShulkerBoxBlock;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.item.BlockItem;
+import net.minecraft.item.ItemStack;
+import net.minecraft.component.type.ContainerComponent;
+import net.minecraft.block.ShulkerBoxBlock;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -56,7 +56,7 @@ public class ContainerPreview extends Module {
         .build());
 
     public ContainerPreview() {
-        super(AddonTemplate.CATEGORY, "container-preview",
+        super(DWAddons.CATEGORY, "container-preview",
             "Previews shulker/container contents on hover in inventories. Read-only.");
     }
 
@@ -65,7 +65,7 @@ public class ContainerPreview extends Module {
         ItemStack stack = event.itemStack;
         if (stack == null || stack.isEmpty()) return;
 
-        ItemContainerContents contents = stack.get(DataComponents.CONTAINER);
+        ContainerComponent contents = stack.get(DataComponentTypes.CONTAINER);
         if (contents == null) return;
 
         boolean isShulker = stack.getItem() instanceof BlockItem bi

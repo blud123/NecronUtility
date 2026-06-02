@@ -5,7 +5,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import meteordevelopment.meteorclient.commands.Command;
 import meteordevelopment.meteorclient.systems.modules.Modules;
-import net.minecraft.commands.SharedSuggestionProvider;
+import net.minecraft.command.CommandSource;
 
 import java.util.List;
 
@@ -17,7 +17,7 @@ public class LoadoutCommand extends Command {
     }
 
     @Override
-    public void build(LiteralArgumentBuilder<SharedSuggestionProvider> builder) {
+    public void build(LiteralArgumentBuilder<CommandSource> builder) {
         builder.then(literal("save").then(argument("name", StringArgumentType.word()).executes(ctx -> {
             module().saveLoadout(StringArgumentType.getString(ctx, "name"));
             return SINGLE_SUCCESS;
