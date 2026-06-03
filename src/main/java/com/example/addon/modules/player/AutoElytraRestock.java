@@ -75,8 +75,13 @@ public class AutoElytraRestock extends Module {
         .description("Status notifications. Falls back to NecronConfig.")
         .defaultValue("").build());
 
+    // Ticks to wait after a completed cycle before re-triggering. Stops a land→pull-nothing→relaunch
+    // loop when the ender chest has no spare elytra/rockets to restock from.
+    private static final int RETRIGGER_COOLDOWN = 200;
+
     private State state = State.IDLE;
     private int stepTimer = 0;
+    private int retriggerCooldown = 0;
     private BlockPos chestPos = null;
 
     public AutoElytraRestock() {
@@ -88,6 +93,7 @@ public class AutoElytraRestock extends Module {
     public void onActivate() {
         state = State.IDLE;
         stepTimer = 0;
+        retriggerCooldown = 0;
         chestPos = null;
         if (!Modules.get().isActive(PacketAntiKick.class)) {
             warning("PacketAntiKick is not active — strongly recommended for this module.");
@@ -104,6 +110,7 @@ public class AutoElytraRestock extends Module {
         if (mc.player == null || mc.world == null) return;
 
         if (state == State.IDLE) {
+            if (retriggerCooldown > 0) { retriggerCooldown--; return; }
             if (shouldTrigger()) {
                 state = State.DESCEND;
                 stepTimer = 0;
@@ -180,6 +187,7 @@ public class AutoElytraRestock extends Module {
                     mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
                 DiscordWebhook.sendMessage(NecronConfig.resolveWebhook(webhookUrl.get()),
                     "AutoElytraRestock complete — relaunched.");
+                retriggerCooldown = RETRIGGER_COOLDOWN;
                 state = State.IDLE;
             }
             default -> state = State.IDLE;

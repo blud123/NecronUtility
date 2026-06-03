@@ -110,6 +110,21 @@ public class Nuker extends Module {
         .defaultValue(true)
         .build());
 
+    private final Setting<Boolean> reachCheck = sgFilter.add(new BoolSetting.Builder()
+        .name("reach-check")
+        .description("Skip blocks whose nearest point is beyond max-reach from your eyes. Breaking out-of-reach blocks is a Grim flag on 2b2t; with the default radius nothing changes, it only trims the unreachable corners that appear once you raise the radius.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Double> maxReach = sgFilter.add(new DoubleSetting.Builder()
+        .name("max-reach")
+        .description("Reach distance (blocks) from your eyes to a block's nearest point. ~6 matches Grim's block-break reach.")
+        .defaultValue(6.0)
+        .min(1.0).max(7.0)
+        .sliderRange(3.0, 7.0)
+        .visible(reachCheck::get)
+        .build());
+
     // — Render —
     private final Setting<Boolean> renderBlocks = sgRender.add(new BoolSetting.Builder()
         .name("render")
@@ -121,24 +136,28 @@ public class Nuker extends Module {
         .name("shape-mode")
         .description("How to render the block overlay.")
         .defaultValue(ShapeMode.Both)
+        .visible(renderBlocks::get)
         .build());
 
     private final Setting<SettingColor> fillColor = sgRender.add(new ColorSetting.Builder()
         .name("fill-color")
         .description("Color of the overlay fill.")
         .defaultValue(new SettingColor(255, 0, 0, 50))
+        .visible(renderBlocks::get)
         .build());
 
     private final Setting<SettingColor> outlineColor = sgRender.add(new ColorSetting.Builder()
         .name("outline-color")
         .description("Color of the overlay outline.")
         .defaultValue(new SettingColor(255, 0, 0, 255))
+        .visible(renderBlocks::get)
         .build());
 
     private final Setting<Boolean> rainbow = sgRender.add(new BoolSetting.Builder()
         .name("rainbow")
         .description("Cycle through rainbow colors.")
         .defaultValue(false)
+        .visible(renderBlocks::get)
         .build());
 
     private final Setting<Double> rainbowSpeed = sgRender.add(new DoubleSetting.Builder()
@@ -147,7 +166,7 @@ public class Nuker extends Module {
         .defaultValue(1.0)
         .min(0.1).max(5.0)
         .sliderRange(0.1, 5.0)
-        .visible(rainbow::get)
+        .visible(() -> renderBlocks.get() && rainbow.get())
         .build());
 
     public enum SortMode { CLOSEST, LOWEST, HIGHEST }
@@ -372,11 +391,15 @@ public class Nuker extends Module {
         int oy = (int) Math.floor(eye.y);
         int oz = (int) Math.floor(eye.z);
 
+        boolean checkReach = reachCheck.get();
+        double reachSq = maxReach.get() * maxReach.get();
+
         for (int[] off : offsets) {
             scratch.set(ox + off[0], oy + off[1], oz + off[2]);
             BlockState state = mc.world.getBlockState(scratch);
             if (shouldSkip(state)) continue;
             if (onlyExposed.get() && !hasExposedFace(scratch)) continue;
+            if (checkReach && dist2ToBlock(eye, scratch) > reachSq) continue;
             BlockPos pos = scratch.toImmutable();
             validTargets.add(pos);
             targetSet.add(pos);
@@ -411,6 +434,15 @@ public class Nuker extends Module {
         offsets = list.toArray(new int[0][]);
         cachedRadius = r;
         cachedSort = mode;
+    }
+
+    /** Squared distance from {@code eye} to the nearest point of the block's 1×1×1 box at {@code pos}. */
+    private static double dist2ToBlock(Vec3d eye, BlockPos pos) {
+        double nx = Math.max(pos.getX(), Math.min(eye.x, pos.getX() + 1.0));
+        double ny = Math.max(pos.getY(), Math.min(eye.y, pos.getY() + 1.0));
+        double nz = Math.max(pos.getZ(), Math.min(eye.z, pos.getZ() + 1.0));
+        double dx = eye.x - nx, dy = eye.y - ny, dz = eye.z - nz;
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private boolean hasExposedFace(BlockPos pos) {

@@ -15,6 +15,7 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * MovementProbe: instruments the connection so you can reverse-engineer when and why the server
@@ -68,7 +69,14 @@ public class MovementProbe extends Module {
     // --- live state ---
     private double prevY;
     private Vec3d lastForced;          // last position the server forced us to (set-back parking spot)
-    private int movePackets;           // movement packets sent during the current tick
+    private final AtomicInteger movePackets = new AtomicInteger(); // move packets sent during the current tick
+
+    // Event markers handed from the Netty thread to the client tick loop (drained in onTick), so the
+    // packet handlers never read mc.player / the ring buffers / chat off the client thread.
+    private final AtomicInteger pendingSetbacks   = new AtomicInteger();
+    private final AtomicInteger pendingServerVel  = new AtomicInteger();
+    private final AtomicInteger pendingExplosions = new AtomicInteger();
+    private final AtomicInteger pendingKicks      = new AtomicInteger();
     private int ticksSinceSetback;
     private long tick;
 
@@ -97,7 +105,11 @@ public class MovementProbe extends Module {
     @Override
     public void onActivate() {
         tick = 0;
-        movePackets = 0;
+        movePackets.set(0);
+        pendingSetbacks.set(0);
+        pendingServerVel.set(0);
+        pendingExplosions.set(0);
+        pendingKicks.set(0);
         ticksSinceSetback = 0;
         setbacks = serverVel = explosions = kicks = 0;
         peakYDeltaNoSetback = 0;
@@ -129,31 +141,24 @@ public class MovementProbe extends Module {
 
     @EventHandler
     private void onSend(PacketEvent.Send event) {
-        if (event.packet instanceof PlayerMoveC2SPacket) movePackets++;
-        else if (trackVehicle.get() && event.packet instanceof VehicleMoveC2SPacket) movePackets++;
+        if (event.packet instanceof PlayerMoveC2SPacket) movePackets.incrementAndGet();
+        else if (trackVehicle.get() && event.packet instanceof VehicleMoveC2SPacket) movePackets.incrementAndGet();
     }
 
     @EventHandler
     private void onReceive(PacketEvent.Receive event) {
-        // Match by simple class name so the probe survives the packet renames between MC versions.
+        // Netty thread: classify by simple class name (version-proof) and only bump a counter. All
+        // chat / mc.player / ring-buffer work is done from the marker in onTick (client thread).
         String name = event.packet.getClass().getSimpleName();
 
-        if (name.contains("PlayerPosition") || name.contains("Teleport")) {
-            onSetback();                       // server forced our position = the punishment
-        } else if (name.contains("EntityVelocityUpdate")) {
-            serverVel++;                       // note: fired for any entity, not just us
-            if (logChat.get()) info(String.format(Locale.ROOT, "applied velocity packet (#%d)", serverVel));
-        } else if (name.contains("Explosion")) {
-            explosions++;
-            if (logChat.get()) info(String.format(Locale.ROOT, "explosion velocity (#%d)", explosions));
-        } else if (name.contains("Disconnect")) {
-            kicks++;
-            if (logChat.get()) info(String.format(Locale.ROOT, "DISCONNECT received (#%d) - likely kicked", kicks));
-        }
+        if (name.contains("PlayerPosition") || name.contains("Teleport")) pendingSetbacks.incrementAndGet();
+        else if (name.contains("EntityVelocityUpdate")) pendingServerVel.incrementAndGet();
+        else if (name.contains("Explosion")) pendingExplosions.incrementAndGet();
+        else if (name.contains("Disconnect")) pendingKicks.incrementAndGet();
     }
 
-    private void onSetback() {
-        setbacks++;
+    private void onSetback(int count) {
+        setbacks += count;
         setbackThisTick = true;
         updateForcedNextTick = true;
 
@@ -185,6 +190,16 @@ public class MovementProbe extends Module {
             updateForcedNextTick = false;
         }
 
+        // Drain markers handed over from the Netty thread and act on them on the client thread.
+        int sb = pendingSetbacks.getAndSet(0);
+        if (sb > 0) onSetback(sb);
+        int sv = pendingServerVel.getAndSet(0);
+        if (sv > 0) { serverVel += sv; if (logChat.get()) info(String.format(Locale.ROOT, "applied velocity packet (#%d)", serverVel)); }
+        int ex = pendingExplosions.getAndSet(0);
+        if (ex > 0) { explosions += ex; if (logChat.get()) info(String.format(Locale.ROOT, "explosion velocity (#%d)", explosions)); }
+        int kk = pendingKicks.getAndSet(0);
+        if (kk > 0) { kicks += kk; if (logChat.get()) info(String.format(Locale.ROOT, "DISCONNECT received (#%d) - likely kicked", kicks)); }
+
         double y = mc.player.getY();
         double yDelta = y - prevY;
 
@@ -206,12 +221,12 @@ public class MovementProbe extends Module {
         spdHist[histIdx] = hSpeed;
         histIdx = (histIdx + 1) % yHist.length;
 
+        int mp = movePackets.getAndSet(0);
         if (logFile.get() && writer != null) {
-            writeCsv(tick, pos, yDelta, hSpeed, vel.y, onGround, gliding, movePackets, ticksSinceSetback, drift, setbackThisTick);
+            writeCsv(tick, pos, yDelta, hSpeed, vel.y, onGround, gliding, mp, ticksSinceSetback, drift, setbackThisTick);
         }
 
         prevY = y;
-        movePackets = 0;
         ticksSinceSetback++;
         setbackThisTick = false;
     }

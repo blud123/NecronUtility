@@ -141,7 +141,8 @@ public class Ascend extends Module {
     // --- state ---
     private double expSpeed;       // EXPONENTIAL persisted velocity
     private double packetServerY;  // PACKET_FLOOD walked-up Y
-    private Vec3d lastServerPos;   // for CLIENT_DESYNC resync
+    private Vec3d lastServerPos;   // for CLIENT_DESYNC resync (client-thread only)
+    private volatile boolean serverPosDirty; // set on Netty thread when a teleport arrives; consumed in onTick
     private boolean suppressing;   // CLIENT_DESYNC: cancel outgoing move packets
     private double lastBurrowY;    // COLLISION/BURROW: detect server teleport steps
 
@@ -156,6 +157,7 @@ public class Ascend extends Module {
         expSpeed = 0.05;
         packetServerY = mc.player.getY();
         lastServerPos = mc.player.getPos();
+        serverPosDirty = false;
         lastBurrowY = mc.player.getY();
         suppressing = method.get() == Method.CLIENT_DESYNC;
     }
@@ -165,7 +167,12 @@ public class Ascend extends Module {
         suppressing = false;
         if (mc.player != null) {
             mc.player.setNoGravity(false);
-            resync();
+            // Only CLIENT_DESYNC drives the client position away from the server, so only it needs a
+            // snap-back. The velocity methods (LINEAR/QUADRATIC/EXPONENTIAL/ELYTRA_GLIDE/COLLISION)
+            // send real positions every tick, so when they stay inside tolerance no teleport ever
+            // arrives and lastServerPos is left at the activation spot — resyncing to it would yank
+            // the player backwards. Matches the resync-key's documented "CLIENT_DESYNC only" scope.
+            if (method.get() == Method.CLIENT_DESYNC) resync();
         }
     }
 
@@ -184,17 +191,18 @@ public class Ascend extends Module {
 
     @EventHandler
     private void onReceive(PacketEvent.Receive event) {
-        // Track the last server-acked position for clean resync (match by simple name, version-proof).
+        // Netty thread: only flag that a teleport landed (match by simple name, version-proof). The
+        // actual position is read on the client thread in onTick — reading mc.player here is a race.
         String n = event.packet.getClass().getSimpleName();
-        if ((n.contains("PlayerPosition") || n.contains("Teleport")) && mc.player != null) {
-            // The teleport is applied around now; capture next tick in onTick to be safe.
-            lastServerPos = mc.player.getPos();
-        }
+        if (n.contains("PlayerPosition") || n.contains("Teleport")) serverPosDirty = true;
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null) return;
+
+        // Capture the post-teleport position safely on the client thread.
+        if (serverPosDirty) { lastServerPos = mc.player.getPos(); serverPosDirty = false; }
 
         // keep suppression state in sync with the selected method
         suppressing = method.get() == Method.CLIENT_DESYNC;

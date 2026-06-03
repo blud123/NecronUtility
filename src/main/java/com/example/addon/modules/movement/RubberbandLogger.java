@@ -6,38 +6,62 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.orbit.EventHandler;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.item.Items;
+import net.minecraft.network.packet.Packet;
+import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+import net.minecraft.network.packet.c2s.play.VehicleMoveC2SPacket;
+import net.minecraft.network.packet.s2c.common.DisconnectS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
+import net.minecraft.network.packet.s2c.play.ExplosionS2CPacket;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.util.math.Vec3d;
 
 import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * RubberbandLogger: focused on capturing the exact state around each set-back ("rubberband") so the
- * logs can be mined for correlations.
+ * RubberbandLogger: captures the exact state around each set-back ("rubberband") so the logs can be
+ * mined for correlations.
  *
  * The hard part of catching a rubberband is that by the time you notice it, the interesting state is
  * already gone. So this keeps a rolling ring buffer of the last N ticks of motion. When the server
  * sends a forced-position / teleport packet, it:
  *   - reads the buffered state from the tick JUST BEFORE the event (the bps + height that triggered it)
  *   - measures the correction itself (how far, in which direction, the server moved you)
- *   - watches the following few ticks to see how recovery behaves
  *   - writes one rich row to rubberband.csv and a readable block to rubberband-log.txt
  *
  * "bps" is reported as vertical bps (yDelta * 20), horizontal bps (hSpeed * 20), and total. Height is
  * the Y at the pre-event tick. Everything else that plausibly matters is captured alongside so you
  * don't have to guess in advance which variable correlates.
  *
- * Pure observer: it never changes your movement. Run it while you trigger ascents with another
+ * <p><b>Threading.</b> {@link PacketEvent.Receive}/{@link PacketEvent.Send} fire on the Netty I/O
+ * thread, but the player state, ring buffer and file writers are only ever touched from the client
+ * tick thread. The packet handlers therefore do the absolute minimum — classify the packet and hand
+ * a marker across via {@link AtomicReference}/{@link AtomicInteger} — and all capture, chat and file
+ * I/O happens in {@link #onTick}. (The previous version mutated plain fields and wrote files from the
+ * Netty thread; those writes were not guaranteed visible to the tick loop, so nothing got logged.)
+ *
+ * <p>Pure observer: it never changes your movement. Run it while you trigger ascents with another
  * module; it just records what the server does back.
  *
- * Yarn mappings, Minecraft 1.21.8.
+ * <p>Yarn mappings, Minecraft 1.21.8. Packets are matched with {@code instanceof} against the real
+ * mapped classes rather than by class-name substring, which also fixes the outbound move-packet
+ * counter (the move packets are inner classes whose simple names don't contain "PlayerMove").
  */
 public class RubberbandLogger extends Module {
+
+    /** Ticks after the last chorus-fruit-eating tick during which set-backs are treated as chorus warps. */
+    private static final int CHORUS_GRACE_TICKS = 10;
 
     private final SettingGroup sg = settings.getDefaultGroup();
 
@@ -47,10 +71,19 @@ public class RubberbandLogger extends Module {
         .defaultValue(20).min(2).max(100).sliderRange(2, 100)
         .build());
 
-    private final Setting<Integer> postWindow = sg.add(new IntSetting.Builder()
-        .name("post-window")
-        .description("Ticks tracked after an event to measure recovery.")
-        .defaultValue(15).min(1).max(60).sliderRange(1, 60)
+    private final Setting<Integer> mergeWindow = sg.add(new IntSetting.Builder()
+        .name("merge-window")
+        .description("After an event is logged, collapse any further set-back packets within this many "
+            + "ticks into the same event. Anticheats often send 2-3 position corrections for one "
+            + "rubberband; this stops that becoming 3 rows. The first packet always logs.")
+        .defaultValue(10).min(0).max(60).sliderRange(0, 60)
+        .build());
+
+    private final Setting<Boolean> velocityEvents = sg.add(new BoolSetting.Builder()
+        .name("velocity-events")
+        .description("Also log server-applied velocity (knockback/explosion) aimed at YOU. Off by default "
+            + "so the file stays focused on set-backs.")
+        .defaultValue(false)
         .build());
 
     private final Setting<Boolean> csv = sg.add(new BoolSetting.Builder()
@@ -73,12 +106,11 @@ public class RubberbandLogger extends Module {
 
     // ---- rolling per-tick history ----
     private static final class Snap {
-        long tick;
         double x, y, z;
         double yDelta;      // blocks gained this tick
         double hSpeed;      // horizontal blocks this tick
         double velY;        // intended vertical velocity
-        boolean onGround, gliding, inWeb, levitation;
+        boolean onGround, gliding, levitation;
         int movePackets;    // outgoing move packets that tick
         int sinceLast;      // ticks since previous event
     }
@@ -88,17 +120,21 @@ public class RubberbandLogger extends Module {
     private boolean ringFilled;
 
     private double prevY;
-    private int movePacketsThisTick;
-    private long tick;
     private int sinceLastEvent;
     private int eventCount;
+    private int chorusGrace;            // >0 means a chorus warp is expected; suppress set-back capture
 
-    // post-event recovery tracking
-    private boolean awaitingRecovery;
-    private int recoveryTick;
-    private Vec3d eventPos;          // where we were when the set-back hit (pre-event position)
-    private Vec3d correctionPos;     // where the server put us
-    private Snap eventSnap;
+    // ---- cross-thread handoff (Netty -> tick) ----
+    private final AtomicReference<String> pendingEvent = new AtomicReference<>();
+    private final AtomicInteger sendMoveCount = new AtomicInteger();
+
+    // ---- capture state (tick thread only) ----
+    private boolean capturePending;     // captured last tick, correction measured this tick
+    private int mergeLeft;              // debounce countdown after a logged event
+    private String capType;
+    private double capVBps, capHBps, capTBps, capHeight;
+    private Snap capSnap;
+    private Vec3d capPos;               // pre-event position
 
     private BufferedWriter csvW, txtW;
     private final SimpleDateFormat stamp = new SimpleDateFormat("HH:mm:ss");
@@ -114,15 +150,17 @@ public class RubberbandLogger extends Module {
         for (int i = 0; i < ring.length; i++) ring[i] = new Snap();
         ringPos = 0;
         ringFilled = false;
-        tick = 0;
         sinceLastEvent = 0;
         eventCount = 0;
-        movePacketsThisTick = 0;
-        awaitingRecovery = false;
+        capturePending = false;
+        mergeLeft = 0;
+        chorusGrace = 0;
+        pendingEvent.set(null);
+        sendMoveCount.set(0);
         prevY = mc.player != null ? mc.player.getY() : 0;
         if (csv.get()) openCsv();
         if (txt.get()) openTxt();
-        info("RubberbandLogger armed. Trigger your ascents; set-backs will be logged.");
+        info("RubberbandLogger armed; logs at %s", logDir());
     }
 
     @Override
@@ -131,67 +169,41 @@ public class RubberbandLogger extends Module {
         closeAll();
     }
 
+    // ── Netty thread: classify only, hand a marker to the tick loop ──────────
+
     @EventHandler
     private void onSend(PacketEvent.Send event) {
-        String n = event.packet.getClass().getSimpleName();
-        if (n.contains("PlayerMove") || n.contains("VehicleMove")) movePacketsThisTick++;
+        Packet<?> p = event.packet;
+        // instanceof PlayerMoveC2SPacket catches all four inner subtypes (Full / PositionAndOnGround
+        // / LookAndOnGround / OnGroundOnly) — their simple names don't contain "PlayerMove".
+        if (p instanceof PlayerMoveC2SPacket || p instanceof VehicleMoveC2SPacket) {
+            sendMoveCount.incrementAndGet();
+        }
     }
 
     @EventHandler
     private void onReceive(PacketEvent.Receive event) {
-        String n = event.packet.getClass().getSimpleName();
-        if (mc.player == null) return;
-
-        boolean setback = n.contains("PlayerPosition") || n.contains("Teleport");
-        if (setback) {
-            captureEvent("setback");
-        } else if (n.contains("Explosion") || n.contains("EntityVelocityUpdate")) {
-            // Not a rubberband, but log it: distinguishes server-APPLIED velocity from punishment.
-            captureEvent(n.contains("Explosion") ? "explosion-vel" : "applied-vel");
-        } else if (n.contains("Disconnect")) {
-            captureEvent("kick");
+        Packet<?> p = event.packet;
+        if (p instanceof PlayerPositionLookS2CPacket) {
+            // Set-back wins over any pending velocity event.
+            pendingEvent.set("setback");
+        } else if (p instanceof DisconnectS2CPacket) {
+            pendingEvent.set("kick");
+        } else if (velocityEvents.get()) {
+            if (p instanceof ExplosionS2CPacket) {
+                pendingEvent.compareAndSet(null, "explosion-vel");
+            } else if (p instanceof EntityVelocityUpdateS2CPacket vp
+                && mc.player != null && vp.getEntityId() == mc.player.getId()) {
+                pendingEvent.compareAndSet(null, "applied-vel");
+            }
         }
     }
 
-    /** Reads the pre-event snapshot and arms recovery measurement. */
-    private void captureEvent(String type) {
-        eventCount++;
-        Snap before = previousSnap();      // tick just before the event
-        eventSnap = before;
-        eventPos = before != null ? new Vec3d(before.x, before.y, before.z) : mc.player.getPos();
-        correctionPos = null;              // filled next tick once the teleport is applied
-        awaitingRecovery = true;
-        recoveryTick = 0;
-
-        double vBps = before != null ? before.yDelta * 20.0 : 0;
-        double hBps = before != null ? before.hSpeed * 20.0 : 0;
-        double tBps = Math.sqrt(vBps * vBps + hBps * hBps);
-        double height = before != null ? before.y : mc.player.getY();
-
-        if (chat.get()) {
-            info(String.format(Locale.ROOT,
-                "[%s] #%d vBps=%.1f hBps=%.1f Y=%.1f sinceLast=%d",
-                type, eventCount, vBps, hBps, height, before != null ? before.sinceLast : -1));
-        }
-
-        // stash type + derived values to write once the correction vector is known
-        pendingType = type;
-        pendingVBps = vBps;
-        pendingHBps = hBps;
-        pendingTBps = tBps;
-        pendingHeight = height;
-
-        sinceLastEvent = 0;
-    }
-
-    // pending event fields (written after correction measured)
-    private String pendingType;
-    private double pendingVBps, pendingHBps, pendingTBps, pendingHeight;
+    // ── Tick thread: capture, measure correction, write ──────────────────────
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null) return;
-        tick++;
 
         double y = mc.player.getY();
         Vec3d pos = mc.player.getPos();
@@ -199,42 +211,68 @@ public class RubberbandLogger extends Module {
         double yDelta = y - prevY;
         double hSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-        // If an event just fired, the correction position is known now -> finalize the record.
-        if (awaitingRecovery && correctionPos == null) {
-            correctionPos = pos;
-            double dx = eventPos != null ? correctionPos.x - eventPos.x : 0;
-            double dy = eventPos != null ? correctionPos.y - eventPos.y : 0;
-            double dz = eventPos != null ? correctionPos.z - eventPos.z : 0;
-            double pullDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            writeEvent(pendingType, pendingVBps, pendingHBps, pendingTBps, pendingHeight,
-                eventSnap, dx, dy, dz, pullDist);
+        // A chorus-fruit teleport is a player-initiated warp, not an anti-cheat set-back. While the
+        // player is eating a chorus fruit (and for a short grace window after, since the warp lands a
+        // tick or two after consumption finishes) we mark the next set-back as expected and skip it.
+        boolean eatingChorus = mc.player.isUsingItem()
+            && mc.player.getActiveItem().getItem() == Items.CHORUS_FRUIT;
+        if (eatingChorus) chorusGrace = CHORUS_GRACE_TICKS;
+
+        // 1) Finalize a capture made on a PREVIOUS tick. By now the set-back has been applied and the
+        // corrected position has settled, so 'pos' is where the server put us.
+        if (capturePending) {
+            double dx = capPos != null ? pos.x - capPos.x : 0;
+            double dy = capPos != null ? pos.y - capPos.y : 0;
+            double dz = capPos != null ? pos.z - capPos.z : 0;
+            double pull = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            writeEvent(capType, capVBps, capHBps, capTBps, capHeight, capSnap, dx, dy, dz, pull);
+            capturePending = false;
+            mergeLeft = mergeWindow.get();
         }
 
-        // record this tick into the ring
+        // 2) Consume a new event marker handed over from the Netty thread.
+        String ev = pendingEvent.getAndSet(null);
+        if (ev != null && mergeLeft == 0) {
+            boolean chorusWarp = "setback".equals(ev) && chorusGrace > 0;
+            if (!chorusWarp) {
+                capture(ev);   // reads the tick-before snapshot (not yet overwritten below)
+            }
+        }
+
+        // 3) Record this tick into the ring.
         Snap s = ring[ringPos];
-        s.tick = tick;
         s.x = pos.x; s.y = y; s.z = pos.z;
         s.yDelta = yDelta;
         s.hSpeed = hSpeed;
         s.velY = vel.y;
         s.onGround = mc.player.isOnGround();
         s.gliding = mc.player.isGliding();
-        s.inWeb = false; // placeholder; wire to status effects if needed
-        s.levitation = mc.player.hasStatusEffect(net.minecraft.entity.effect.StatusEffects.LEVITATION);
-        s.movePackets = movePacketsThisTick;
+        s.levitation = mc.player.hasStatusEffect(StatusEffects.LEVITATION);
+        s.movePackets = sendMoveCount.getAndSet(0);
         s.sinceLast = sinceLastEvent;
 
         ringPos = (ringPos + 1) % ring.length;
         if (ringPos == 0) ringFilled = true;
 
-        if (awaitingRecovery) {
-            recoveryTick++;
-            if (recoveryTick >= postWindow.get()) awaitingRecovery = false;
-        }
-
+        if (mergeLeft > 0) mergeLeft--;
+        if (chorusGrace > 0) chorusGrace--;
         prevY = y;
-        movePacketsThisTick = 0;
         sinceLastEvent++;
+    }
+
+    /** Reads the pre-event snapshot and arms finalize for the next tick. */
+    private void capture(String type) {
+        eventCount++;
+        Snap before = previousSnap();      // tick just before the event
+        capSnap = before;
+        capPos = before != null ? new Vec3d(before.x, before.y, before.z) : mc.player.getPos();
+        capVBps = before != null ? before.yDelta * 20.0 : 0;
+        capHBps = before != null ? before.hSpeed * 20.0 : 0;
+        capTBps = Math.sqrt(capVBps * capVBps + capHBps * capHBps);
+        capHeight = before != null ? before.y : mc.player.getY();
+        capType = type;
+        capturePending = true;
+        sinceLastEvent = 0;
     }
 
     /** The snapshot from the tick immediately before the current one (the 'just before' state). */
@@ -250,22 +288,27 @@ public class RubberbandLogger extends Module {
     }
 
     // ---------- io ----------
+    private Path logDir() {
+        return FabricLoader.getInstance().getGameDir();
+    }
+
     private void openCsv() {
         try {
-            File f = new File(mc.runDirectory, "rubberband.csv");
-            csvW = new BufferedWriter(new FileWriter(f, true)); // append across sessions
-            if (f.length() == 0) {
+            Path f = logDir().resolve("rubberband.csv");
+            boolean fresh = !Files.exists(f) || Files.size(f) == 0;
+            csvW = Files.newBufferedWriter(f, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            if (fresh) {
                 csvW.write("time,event,n,vBps,hBps,totalBps,height,velY,onGround,gliding,levitation,"
                     + "movePackets,sinceLast,pullX,pullY,pullZ,pullDist\n");
+                csvW.flush();
             }
-            csvW.flush();
         } catch (IOException e) { csvW = null; warning("rubberband.csv open failed: " + e.getMessage()); }
     }
 
     private void openTxt() {
         try {
-            File f = new File(mc.runDirectory, "rubberband-log.txt");
-            txtW = new BufferedWriter(new FileWriter(f, true));
+            Path f = logDir().resolve("rubberband-log.txt");
+            txtW = Files.newBufferedWriter(f, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
             txtW.write("\n=== session " + stamp.format(new Date()) + " ===\n");
             txtW.flush();
         } catch (IOException e) { txtW = null; warning("rubberband-log.txt open failed: " + e.getMessage()); }
@@ -274,6 +317,11 @@ public class RubberbandLogger extends Module {
     private void writeEvent(String type, double vBps, double hBps, double tBps, double height,
                             Snap s, double dx, double dy, double dz, double pull) {
         String time = stamp.format(new Date());
+
+        if (chat.get()) {
+            info(String.format(Locale.ROOT,
+                "[%s] #%d vBps=%.1f hBps=%.1f Y=%.1f pulled=%.2f", type, eventCount, vBps, hBps, height, pull));
+        }
         if (csvW != null) {
             try {
                 csvW.write(String.format(Locale.ROOT,
@@ -287,7 +335,7 @@ public class RubberbandLogger extends Module {
                     s != null ? s.sinceLast : -1,
                     dx, dy, dz, pull));
                 csvW.flush();
-            } catch (IOException e) { closeAll(); }
+            } catch (IOException e) { warning("rubberband.csv write failed: " + e.getMessage()); }
         }
         if (txtW != null) {
             try {
@@ -301,7 +349,7 @@ public class RubberbandLogger extends Module {
                     s != null ? s.movePackets : -1, s != null ? s.sinceLast : -1,
                     dx, dy, dz, pull));
                 txtW.flush();
-            } catch (IOException e) { closeAll(); }
+            } catch (IOException e) { warning("rubberband-log.txt write failed: " + e.getMessage()); }
         }
     }
 

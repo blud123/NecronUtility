@@ -4,11 +4,7 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "SilentSwapMixin",
-    "ElytraEntityMixin",
-    "ElytraLivingEntityMixin",
-    "EntityAccessor",
-    "LivingEntityInvoker",
-    "IServerboundMovePlayerPacket"
+    "LivingEntityInvoker"
   ],
   "injectors": {
     "defaultRequire": 1

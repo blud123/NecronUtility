@@ -18,10 +18,10 @@ import net.minecraft.util.PlayerInput;
 import net.minecraft.item.Items;
 import net.minecraft.util.math.Vec3d;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class Disabler extends Module {
 
@@ -200,12 +200,15 @@ public class Disabler extends Module {
     //  STATE
     // ═══════════════════════════════════════════
 
-    private long tick = 0;
+    // tick is written on the client thread (onTick) and read on the Netty thread (onPacketReceive).
+    private volatile long tick = 0;
     private int  pulseCounter = 0;
 
-    // Each entry: {id, releaseTick}
-    private final ArrayDeque<long[]> pendingPings      = new ArrayDeque<>();
-    private final ArrayDeque<long[]> pendingKeepAlives = new ArrayDeque<>();
+    // Each entry: {id, releaseTick}. These are produced on the Netty I/O thread (packets are
+    // received/cancelled there) and consumed on the client tick thread, so they must be concurrent —
+    // a plain ArrayDeque would corrupt or drop entries, and a dropped keepalive means a timeout kick.
+    private final ConcurrentLinkedQueue<long[]> pendingPings      = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<long[]> pendingKeepAlives = new ConcurrentLinkedQueue<>();
 
     // ═══════════════════════════════════════════
     //  CONSTRUCTOR

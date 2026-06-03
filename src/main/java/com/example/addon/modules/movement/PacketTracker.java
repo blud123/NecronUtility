@@ -1,6 +1,7 @@
 package com.example.addon.modules.movement;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import com.example.addon.DWAddons;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
@@ -48,15 +49,25 @@ public class PacketTracker extends Module {
     public static volatile int movePacketsPerSec   = 0;
     public static volatile int chunksPerSec        = 0;
     public static volatile int positionOverrides   = 0;
+    // Published so the HUD's oversend warn-colour follows the configurable limit, not a magic number.
+    public static volatile int oversendThreshold   = 20;
 
-    // ── Internal accumulators ─────────────────────────────────────────────────
+    // ── Internal accumulators (incremented on the Netty thread, drained on the client thread) ──
 
-    private int movePacketAccum  = 0;
-    private int chunkAccum       = 0;
+    private final AtomicInteger movePacketAccum = new AtomicInteger();
+    private final AtomicInteger chunkAccum      = new AtomicInteger();
+    private final AtomicInteger overrideAccum   = new AtomicInteger();
+    // Latest server-forced position, handed from the Netty thread to the tick loop.
+    private final AtomicReference<Vec3d> pendingSetbackPos = new AtomicReference<>();
+
     private int tickCounter      = 0;
 
     // State for stall detection
     private int lastChunksPerSec = 0;
+
+    // Previous-tick client state, so a set-back is compared against where we were before it landed.
+    private Vec3d prevClientPos;
+    private double prevHSpeed;
 
     public PacketTracker() {
         super(DWAddons.CATEGORY, "packet-tracker",
@@ -65,12 +76,18 @@ public class PacketTracker extends Module {
 
     @Override
     public void onActivate() {
-        movePacketAccum = 0;
-        chunkAccum      = 0;
-        tickCounter     = 0;
+        movePacketAccum.set(0);
+        chunkAccum.set(0);
+        overrideAccum.set(0);
+        pendingSetbackPos.set(null);
+        tickCounter        = 0;
+        lastChunksPerSec   = 0;
         movePacketsPerSec  = 0;
         chunksPerSec       = 0;
         positionOverrides  = 0;
+        oversendThreshold  = oversendLimit.get();
+        prevClientPos      = mc.player != null ? mc.player.getPos() : null;
+        prevHSpeed         = 0;
     }
 
     // ── Tick: flush per-second counters every 20 ticks ────────────────────────
@@ -79,69 +96,58 @@ public class PacketTracker extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null) return;
 
-        tickCounter++;
-        if (tickCounter < 20) return;
-        tickCounter = 0;
-
-        movePacketsPerSec = movePacketAccum;
-        lastChunksPerSec  = chunksPerSec;
-        chunksPerSec      = chunkAccum;
-        movePacketAccum   = 0;
-        chunkAccum        = 0;
-
-        // Oversend warning: timer module pushes >20 move packets/sec
-        if (movePacketsPerSec > oversendLimit.get()) {
-            boolean timerActive = Modules.get().isActive(
-                meteordevelopment.meteorclient.systems.modules.world.Timer.class);
-            if (timerActive) {
-                info("Client over-sending movement packets: %d/sec (Timer module may not be throttling properly)",
-                    movePacketsPerSec);
+        // Publish the cumulative override count and handle the latest set-back here on the client
+        // thread, comparing the server's forced position to where we were the previous tick (before
+        // the correction landed) — both reads that used to happen unsafely on the Netty thread.
+        positionOverrides += overrideAccum.getAndSet(0);
+        Vec3d setbackPos = pendingSetbackPos.getAndSet(null);
+        if (setbackPos != null && prevClientPos != null) {
+            double distance = setbackPos.distanceTo(prevClientPos);
+            if (distance >= rubberbandThreshold.get()) {
+                info("Rubberband / Anti-Cheat Rejection — server forced (%.2f, %.2f, %.2f), " +
+                     "client was at (%.2f, %.2f, %.2f), delta=%.2f blocks",
+                    setbackPos.x, setbackPos.y, setbackPos.z,
+                    prevClientPos.x, prevClientPos.y, prevClientPos.z, distance);
+            }
+            if (prevHSpeed >= chunkStallSpeedThreshold.get() && lastChunksPerSec <= 1) {
+                info("Velocity killed due to Chunk Generation Stall " +
+                     "(chunks/sec last interval=%d, speed=%.2f b/t)", lastChunksPerSec, prevHSpeed);
             }
         }
+
+        tickCounter++;
+        if (tickCounter >= 20) {
+            tickCounter = 0;
+            movePacketsPerSec = movePacketAccum.getAndSet(0);
+            lastChunksPerSec  = chunksPerSec;
+            chunksPerSec      = chunkAccum.getAndSet(0);
+            oversendThreshold = oversendLimit.get();
+
+            // Oversend warning: timer module pushes >20 move packets/sec
+            if (movePacketsPerSec > oversendLimit.get()) {
+                boolean timerActive = Modules.get().isActive(
+                    meteordevelopment.meteorclient.systems.modules.world.Timer.class);
+                if (timerActive) {
+                    info("Client over-sending movement packets: %d/sec (Timer module may not be throttling properly)",
+                        movePacketsPerSec);
+                }
+            }
+        }
+
+        Vec3d vel = mc.player.getVelocity();
+        prevHSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+        prevClientPos = mc.player.getPos();
     }
 
-    // ── Incoming packets ──────────────────────────────────────────────────────
+    // ── Incoming packets (Netty thread: classify + count only, no chat/world reads) ────────────
 
     @EventHandler
     private void onReceive(PacketEvent.Receive event) {
-        // 1. Rubberband / position override
         if (event.packet instanceof PlayerPositionLookS2CPacket pkt) {
-            handlePositionPacket(pkt);
-            return;
-        }
-
-        // 2. Chunk delivery counter
-        if (event.packet instanceof ChunkDataS2CPacket) {
-            chunkAccum++;
-        }
-    }
-
-    private void handlePositionPacket(PlayerPositionLookS2CPacket pkt) {
-        positionOverrides++;
-
-        if (mc.player == null) return;
-
-        Vec3d serverPos = pkt.change().position();
-        Vec3d clientPos = mc.player.getPos();
-        double distance = serverPos.distanceTo(clientPos);
-
-        if (distance >= rubberbandThreshold.get()) {
-            info("Rubberband / Anti-Cheat Rejection — server forced (%.2f, %.2f, %.2f), " +
-                 "client was at (%.2f, %.2f, %.2f), delta=%.2f blocks",
-                serverPos.x, serverPos.y, serverPos.z,
-                clientPos.x, clientPos.y, clientPos.z,
-                distance);
-        }
-
-        // Stall correlation: was this override preceded by a chunk-rate collapse?
-        double horizontalSpeed = Math.sqrt(
-            mc.player.getVelocity().x * mc.player.getVelocity().x +
-            mc.player.getVelocity().z * mc.player.getVelocity().z);
-
-        if (horizontalSpeed >= chunkStallSpeedThreshold.get() && lastChunksPerSec <= 1) {
-            info("Velocity killed due to Chunk Generation Stall " +
-                 "(chunks/sec last interval=%d, speed=%.2f b/t)",
-                lastChunksPerSec, horizontalSpeed);
+            overrideAccum.incrementAndGet();
+            pendingSetbackPos.set(pkt.change().position());
+        } else if (event.packet instanceof ChunkDataS2CPacket) {
+            chunkAccum.incrementAndGet();
         }
     }
 
@@ -150,7 +156,7 @@ public class PacketTracker extends Module {
     @EventHandler
     private void onSend(PacketEvent.Send event) {
         if (event.packet instanceof PlayerMoveC2SPacket) {
-            movePacketAccum++;
+            movePacketAccum.incrementAndGet();
         }
     }
 

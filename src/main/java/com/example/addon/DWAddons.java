@@ -5,7 +5,6 @@ import com.example.addon.hud.ElytraDurabilityHud;
 import com.example.addon.hud.PacketTrackerHud;
 import com.example.addon.hud.VerticalVelocityHud;
 import com.example.addon.modules.Disabler;
-import com.example.addon.modules.ElytraBouncePlus;
 import com.example.addon.modules.ElytraFlyPlusPlus;
 import com.example.addon.modules.FastBreak;
 import com.example.addon.modules.NecronConfig;
@@ -19,11 +18,14 @@ import com.example.addon.modules.movement.RubberbandLogger;
 import com.example.addon.modules.movement.VelocityBoost;
 import com.example.addon.modules.movement.VerticalYBoost;
 import com.example.addon.modules.VerticalVelocityTracker;
+import com.example.addon.modules.misc.QueueAlert;
 import com.example.addon.modules.player.AutoElytraRestock;
 import com.example.addon.modules.player.LoadoutSave;
 import com.example.addon.modules.player.PacketAntiKick;
 import com.example.addon.modules.render.ContainerPreview;
 import com.example.addon.modules.render.FpsBoost;
+import com.example.addon.modules.world.ChunkFinder;
+import com.example.addon.modules.world.StashFinder;
 import com.example.addon.utils.PacketLimiter;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.MeteorClient;
@@ -51,7 +53,6 @@ public class DWAddons extends MeteorAddon {
         // Combat / world
         Modules.get().add(new Nuker());
         Modules.get().add(new FastBreak());
-        Modules.get().add(new ElytraBouncePlus());
         Modules.get().add(new ElytraFlyPlusPlus());
         Modules.get().add(new Disabler());
 
@@ -73,6 +74,13 @@ public class DWAddons extends MeteorAddon {
         Modules.get().add(new PacketAntiKick());
         Modules.get().add(new AutoElytraRestock());
         Modules.get().add(new LoadoutSave());
+
+        // World / stash hunting
+        Modules.get().add(new StashFinder());
+        Modules.get().add(new ChunkFinder());
+
+        // Misc
+        Modules.get().add(new QueueAlert());
 
         // Render
         Modules.get().add(new ContainerPreview());

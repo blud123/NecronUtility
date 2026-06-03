@@ -20,6 +20,7 @@ import net.minecraft.util.Hand;
 import net.minecraft.block.BlockState;
 
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.PendingUpdateManager;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -62,6 +63,12 @@ public class FastBreak extends Module {
     // Wall-clock time of the last finishing STOP_DESTROY_BLOCK, for the Grim inter-break delay.
     private long lastFinishMs = 0L;
 
+    // Wall-clock time of the last break activity (start / progress / instant). The held tool slot is
+    // kept synced to the server for a short grace period after this, instead of being flipped back
+    // every idle tick — see onTick for why that matters on slot-deferring servers like 2b2t.
+    private long lastBreakActivityMs = 0L;
+    private static final long RESTORE_GRACE_MS = 250L;
+
     // ── Settings ─────────────────────────────────────────────────────────
     private final SettingGroup sg       = settings.getDefaultGroup();
     private final SettingGroup sgGrim   = settings.createGroup("Grim");
@@ -99,6 +106,12 @@ public class FastBreak extends Module {
         .defaultValue(false)
         .build());
 
+    private final Setting<Boolean> swing = sg.add(new BoolSetting.Builder()
+        .name("swing")
+        .description("Swing your arm with each break, like vanilla mining. Block-break packets with no swing look non-vanilla and can flag on 2b2t/Grim.")
+        .defaultValue(true)
+        .build());
+
     // ── Grim group ───────────────────────────────────────────────────────
     // Anticheat behaviour drifts over time: these mirror Shoreline's 2.x Grim FastBreak handling
     // and may need revalidation against the current Grim build. Not guaranteed to bypass anything.
@@ -134,24 +147,28 @@ public class FastBreak extends Module {
         .name("shape-mode")
         .description("How to render the break overlay.")
         .defaultValue(ShapeMode.Both)
+        .visible(renderBreak::get)
         .build());
 
     private final Setting<SettingColor> fillColor = sgRender.add(new ColorSetting.Builder()
         .name("fill-color")
         .description("Fill color of the break overlay.")
         .defaultValue(new SettingColor(0, 180, 255, 50))
+        .visible(renderBreak::get)
         .build());
 
     private final Setting<SettingColor> outlineColor = sgRender.add(new ColorSetting.Builder()
         .name("outline-color")
         .description("Outline color of the break overlay.")
         .defaultValue(new SettingColor(0, 180, 255, 255))
+        .visible(renderBreak::get)
         .build());
 
     private final Setting<Boolean> rainbow = sgRender.add(new BoolSetting.Builder()
         .name("rainbow")
         .description("Cycle through rainbow colors.")
         .defaultValue(false)
+        .visible(renderBreak::get)
         .build());
 
     private final Setting<Double> rainbowSpeed = sgRender.add(new DoubleSetting.Builder()
@@ -160,7 +177,7 @@ public class FastBreak extends Module {
         .defaultValue(1.0)
         .min(0.1).max(5.0)
         .sliderRange(0.1, 5.0)
-        .visible(rainbow::get)
+        .visible(() -> renderBreak.get() && rainbow.get())
         .build());
 
     // ── Break tracking ────────────────────────────────────────────────────
@@ -209,6 +226,7 @@ public class FastBreak extends Module {
         lastServerSlot = mc.player != null ? mc.player.getInventory().getSelectedSlot() : -1;
         lastRealSlot   = lastServerSlot;
         lastFinishMs   = 0L;
+        lastBreakActivityMs = 0L;
     }
 
     @Override
@@ -252,9 +270,11 @@ public class FastBreak extends Module {
         if (!isActive() || mc.player == null || mc.world == null) return;
         BlockState state = mc.world.getBlockState(pos);
         if (state.isAir()) return;
+        lastBreakActivityMs = System.currentTimeMillis();
         syncToolFor(state, pos);
         MineTarget t = new MineTarget(pos, face, false);
         send(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, t);
+        maybeSwing();
         sendFinish(t);
     }
 
@@ -294,6 +314,7 @@ public class FastBreak extends Module {
     private void beginBreak(BlockPos pos, Direction face) {
         BlockState state = mc.world.getBlockState(pos);
         if (state.isAir()) return;
+        lastBreakActivityMs = System.currentTimeMillis();
 
         // Already tracking this block — nothing to do.
         if ((primary != null && primary.pos.equals(pos)) || (secondary != null && secondary.pos.equals(pos))) {
@@ -344,8 +365,16 @@ public class FastBreak extends Module {
         if (secondary != null) secondary = tickTarget(secondary);
         if (primary   != null) primary   = tickTarget(primary);
 
-        // Once nothing is breaking, hand the real slot back to the server.
-        if (primary == null && secondary == null) restoreSlot();
+        // Once nothing is breaking, hand the real slot back — but only after a short grace period.
+        // Restoring on the very next idle tick made the held slot flip tool→real→tool every tick
+        // while Nuker packet-mines (instant breaks hold no primary/secondary slot). Servers that
+        // apply a held-slot change a tick late (Grim on 2b2t) then evaluate the next START with the
+        // OLD tool, so the block never insta-breaks. Holding the synced tool briefly keeps the
+        // server's view of the held item stable across back-to-back breaks.
+        if (primary == null && secondary == null
+                && System.currentTimeMillis() - lastBreakActivityMs > RESTORE_GRACE_MS) {
+            restoreSlot();
+        }
     }
 
     /** Restarts a target's break progress (used by switch-reset). */
@@ -385,7 +414,9 @@ public class FastBreak extends Module {
         // Hold the tool on the server for the WHOLE break (syncServerSlot only sends on change).
         syncServerSlot(bestSlot != -1 ? bestSlot : mc.player.getInventory().getSelectedSlot());
 
+        lastBreakActivityMs = System.currentTimeMillis();
         target.breakingTicks++;
+        maybeSwing();
         if (target.breakingTicks >= target.estTicks) {
             // Grim inter-break delay: hold the finishing STOP until break-delay-ms has elapsed since
             // the last finish, so finishes aren't sent back-to-back. The block stays at full progress
@@ -482,6 +513,7 @@ public class FastBreak extends Module {
     private void sendStart(MineTarget t)  {
         if (grim.get()) { sendStartGrim(t); return; }
         send(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, t);
+        maybeSwing();
     }
     private void sendAbort(MineTarget t)  { send(PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, t); }
 
@@ -519,6 +551,17 @@ public class FastBreak extends Module {
         mc.player.networkHandler.sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
     }
 
+    /**
+     * Vanilla-style arm swing for a break tick, gated by the {@code swing} setting. Vanilla swings
+     * once per tick while mining; sending destroy actions with no accompanying swing is itself a
+     * tell on 2b2t/Grim, so by default we mirror vanilla. Uses {@code swingHand} (not the raw packet
+     * the Grim sequence uses) so the local arm animation plays too.
+     */
+    private void maybeSwing() {
+        if (!swing.get() || mc.player == null) return;
+        mc.player.swingHand(Hand.MAIN_HAND);
+    }
+
     // STOP_DESTROY_BLOCK both completes a break and hands one off to the server's delayed slot;
     // the server decides which based on its own tracked progress, so finish and hand-off are the
     // same packet (kept as two names for readability).
@@ -526,8 +569,18 @@ public class FastBreak extends Module {
     private void sendFinish(MineTarget t) { send(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, t); }
 
     private void send(PlayerActionC2SPacket.Action action, MineTarget t) {
-        if (mc.player == null) return;
-        mc.player.networkHandler.sendPacket(new PlayerActionC2SPacket(action, t.pos, t.face));
+        if (mc.player == null || mc.world == null) return;
+        // Consume a real, monotonically-increasing block-action sequence id from the shared
+        // pending-update manager (the same counter vanilla uses for every sequenced interaction).
+        // The old code sent sequence 0 on every packet; once the client's counter had advanced past
+        // 0 — which happens after any block place / item use — 2b2t's Grim treated the sequence-0
+        // block action as out-of-order and dropped it, so the break silently failed ("sometimes
+        // doesn't mine"). We deliberately do NOT register a client-side prediction here, so the
+        // block still waits for the server's confirmation (no optimistic removal / ghost blocks) —
+        // we only need a valid, increasing id on the wire.
+        try (PendingUpdateManager seq = mc.world.getPendingUpdateManager().incrementSequence()) {
+            mc.player.networkHandler.sendPacket(new PlayerActionC2SPacket(action, t.pos, t.face, seq.getSequence()));
+        }
     }
 
     // ── Render ────────────────────────────────────────────────────────────
